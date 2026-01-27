@@ -1,4 +1,4 @@
-# # config.py
+# # config.py 
 # from pathlib import Path
 
 # # Absolute path so every script (uvicorn/streamlit) points to the same Chroma DB
@@ -41,12 +41,16 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
-CHROMA_PERSIST_DIR = os.getenv(
-    "CHROMA_PERSIST_DIR",
-    str(BASE_DIR / "data" / "chroma")  # safe local fallback
-)
+# CHROMA_PERSIST_DIR = os.getenv(
+#     "CHROMA_PERSIST_DIR",
+#     str(BASE_DIR / "data" / "chroma")  # safe local fallback
+# )
 
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "logs_titan_1536")
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", str(BASE_DIR / "data" / "chroma"))
+
+
+
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "logs_titan_v2_1024")
 
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 BEDROCK_EMBED_MODEL = os.getenv(

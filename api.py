@@ -12,12 +12,15 @@ from pydantic import BaseModel
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from config import CHROMA_PERSIST_DIR
+
+
 
 from config import (
     AWS_REGION,
     BEDROCK_EMBED_MODEL,
     BEDROCK_LLM_MODEL,
-    CHROMA_DIR,
+    CHROMA_PERSIST_DIR,
     COLLECTION_NAME,
 )
 from vector_store import get_collection
@@ -258,7 +261,7 @@ def index_file_job(job_id: str, file_path: str, filename: str) -> None:
 
 @app.get("/debug_paths")
 def debug_paths():
-    return {"CHROMA_DIR": CHROMA_DIR, "COLLECTION_NAME": COLLECTION_NAME}
+    return {"CHROMA_PERSIST_DIR": CHROMA_PERSIST_DIR, "COLLECTION_NAME": COLLECTION_NAME}
 
 
 @app.get("/stats")

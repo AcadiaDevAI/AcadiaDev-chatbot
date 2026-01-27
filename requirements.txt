@@ -11,3 +11,6 @@ python-multipart
 requests
 boto3
 botocore
+langchain
+langchain-aws
+python-dotenv
