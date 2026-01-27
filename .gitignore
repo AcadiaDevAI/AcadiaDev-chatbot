@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment files
+.env
+
+# Local data folders (chroma persistence, uploads, logs)
+data/
+chroma_db/
+logs/
+uploads/
+
+# OS/editor junk
+.DS_Store
+.vscode/
+.idea/

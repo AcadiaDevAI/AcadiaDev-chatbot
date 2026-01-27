@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic
+chromadb
+requests
+streamlit
+drain3
+pyarrow
+pandas
+python-multipart
+requests
+boto3
+botocore
