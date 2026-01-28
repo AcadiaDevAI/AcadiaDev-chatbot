@@ -206,9 +206,36 @@ def iter_chunks_from_file(file_path: str, max_chars: int = 4000, overlap: int = 
         yield tail
 
 
+def clear_collection() -> None:
+    """
+    Deletes ALL data from the collection.
+    Call this before indexing a new file if you want ONLY the new file's data.
+    """
+    try:
+        # Get all IDs in the collection
+        all_data = coll.get(include=[])
+        all_ids = all_data.get("ids", [])
+        
+        if all_ids:
+            # Delete in batches (ChromaDB limit ~5000 per delete)
+            batch_size = 5000
+            for i in range(0, len(all_ids), batch_size):
+                batch = all_ids[i:i + batch_size]
+                coll.delete(ids=batch)
+            print(f"Cleared {len(all_ids)} vectors from collection")
+    except Exception as e:
+        print(f"Error clearing collection: {e}")
+        raise
+
+
 def index_file_job(job_id: str, file_path: str, filename: str) -> None:
     try:
         UPLOAD_JOBS[job_id]["status"] = "running"
+        
+        # CRITICAL: Clear old data before indexing new file
+        # This ensures only the NEW file's data is searchable
+        clear_collection()
+        
         batch_ids: List[str] = []
         batch_metas: List[Dict[str, Any]] = []
         batch_docs: List[str] = []
@@ -248,6 +275,19 @@ def sources():
     metas = coll.get(include=["metadatas"]).get("metadatas") or []
     files = sorted({m.get("source") for m in metas if isinstance(m, dict) and m.get("source")})
     return {"sources": files, "count": len(files)}
+
+
+@app.post("/clear")
+def clear_all_data():
+    """
+    Endpoint to manually clear all data from the vector store.
+    Useful for testing or starting fresh.
+    """
+    try:
+        clear_collection()
+        return {"status": "success", "message": "All data cleared from collection"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/upload_status/{job_id}")
