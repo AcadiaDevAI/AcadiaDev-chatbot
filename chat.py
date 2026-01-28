@@ -331,7 +331,18 @@ with st.sidebar:
     with st.expander("Backend connection"):
         st.write("API_BASE:", API_BASE)
 
-    uploaded_file = st.file_uploader("Upload .log or .txt file", type=["log", "txt", "md"])
+    # uploaded_file = st.file_uploader("Upload .log or .txt file", type=["log", "txt", "md"])
+
+    uploaded_file = st.file_uploader(
+    "Upload .log or .txt file",
+    type=["log", "txt", "md"],
+    key="uploader"
+)
+
+# ✅ If user selects a new file, update active_source immediately
+if uploaded_file is not None:
+    st.session_state["active_source"] = uploaded_file.name
+
 
     col_a, col_b = st.columns(2)
 
@@ -456,6 +467,12 @@ target_source = st.session_state.get("active_source")
 if not target_source:
     st.info("Upload a log file and click **Start Fast Indexing**. Then ask questions here.")
 
+if st.session_state.get("active_source"):
+    st.caption(
+        f"🔎 Searching within: {st.session_state.get('active_source')}"
+    )
+
+
 col1, col2 = st.columns([3, 1])
 
 with col1:
@@ -467,10 +484,12 @@ if query:
 
     with st.chat_message("assistant"):
         with st.spinner("Analyzing log vectors..."):
-            payload = {
-                "q": query,
-                "source": target_source  # ✅ Force retrieval from active file
-            }
+            # payload = {
+            #     "q": query,
+            #     "source": target_source  # ✅ Force retrieval from active file
+            # }
+            payload = {"q": query, "source": st.session_state.get("active_source")}
+
             result = safe_post_json(f"{API_BASE}/ask", payload, timeout=120)
 
             if isinstance(result, Exception):
