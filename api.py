@@ -50,12 +50,26 @@ MAX_THROTTLE_RETRIES = int(os.getenv("MAX_THROTTLE_RETRIES", "12"))
 BACKOFF_BASE_SECONDS = float(os.getenv("BACKOFF_BASE_SECONDS", "0.5"))
 BACKOFF_MAX_SECONDS = float(os.getenv("BACKOFF_MAX_SECONDS", "20"))
 
+# Context / prompt controls
+CHROMA_N_RESULTS = int(os.getenv("CHROMA_N_RESULTS", "6"))
+MAX_TOTAL_CONTEXT_CHARS = int(os.getenv("MAX_TOTAL_CONTEXT_CHARS", "20000"))
+MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", "6"))
+MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "1800"))
+
+RETRY_MAX_TOTAL_CONTEXT_CHARS = int(os.getenv("RETRY_MAX_TOTAL_CONTEXT_CHARS", "9000"))
+RETRY_MAX_CONTEXT_CHUNKS = int(os.getenv("RETRY_MAX_CONTEXT_CHUNKS", "3"))
+RETRY_MAX_CHUNK_CHARS = int(os.getenv("RETRY_MAX_CHUNK_CHARS", "1200"))
+
 
 def _is_throttle_error(err: Exception) -> bool:
     if not isinstance(err, ClientError):
         return False
     code = err.response.get("Error", {}).get("Code", "")
-    return code in ("ThrottlingException", "TooManyRequestsException", "ProvisionedThroughputExceededException")
+    return code in (
+        "ThrottlingException",
+        "TooManyRequestsException",
+        "ProvisionedThroughputExceededException",
+    )
 
 
 def _invoke_bedrock(model_id: str, payload: dict) -> Any:
@@ -74,6 +88,7 @@ def _invoke_bedrock(model_id: str, payload: dict) -> Any:
                 return json.loads(raw)
             except Exception:
                 return raw
+
         except ClientError as e:
             if _is_throttle_error(e) and attempt < MAX_THROTTLE_RETRIES:
                 wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
@@ -86,27 +101,36 @@ def _invoke_bedrock(model_id: str, payload: dict) -> Any:
 def bedrock_embed(text: str) -> List[float]:
     out = _invoke_bedrock(BEDROCK_EMBED_MODEL, {"inputText": text})
     if isinstance(out, dict):
-        if "embedding" in out: return out["embedding"]
-        if "embeddings" in out and out["embeddings"]: return out["embeddings"][0]
+        if "embedding" in out:
+            return out["embedding"]
+        if "embeddings" in out and out["embeddings"]:
+            return out["embeddings"][0]
         if "outputs" in out and out["outputs"]:
             o = out["outputs"][0]
-            if "embedding" in o: return o["embedding"]
-            if "embeddings" in o and o["embeddings"]: return o["embeddings"][0]
+            if "embedding" in o:
+                return o["embedding"]
+            if "embeddings" in o and o["embeddings"]:
+                return o["embeddings"][0]
     raise ValueError("Unrecognized embedding response")
 
 
 def bedrock_generate(prompt: str, max_tokens: int = 512) -> str:
     out = _invoke_bedrock(BEDROCK_LLM_MODEL, {"prompt": prompt, "max_tokens": max_tokens})
     if isinstance(out, dict):
-        if isinstance(out.get("output"), str): return out["output"]
-        if isinstance(out.get("generated_text"), str): return out["generated_text"]
+        if isinstance(out.get("output"), str):
+            return out["output"]
+        if isinstance(out.get("generated_text"), str):
+            return out["generated_text"]
         if isinstance(out.get("outputs"), list) and out["outputs"]:
             o = out["outputs"][0]
             for k in ("text", "content", "generated_text", "output"):
                 v = o.get(k)
-                if isinstance(v, str) and v.strip(): return v
-    if isinstance(out, str): return out
+                if isinstance(v, str) and v.strip():
+                    return v
+    if isinstance(out, str):
+        return out
     raise ValueError("Unrecognized generation response")
+
 
 # ------------------------------------------------------------------------------
 # Chroma & Helpers
@@ -114,10 +138,12 @@ def bedrock_generate(prompt: str, max_tokens: int = 512) -> str:
 coll = get_collection()
 UPLOAD_JOBS: Dict[str, Dict[str, Any]] = {}
 
+
 class Q(BaseModel):
     q: str
     device: Optional[str] = None
     source: Optional[str] = None
+
 
 SYS_PROMPT = (
     "You are a Cisco TAC engineer. "
@@ -125,49 +151,78 @@ SYS_PROMPT = (
     "If the logs do not contain enough evidence, say what is missing."
 )
 
+
 def _extract_filename(question: str) -> str | None:
     m = re.search(r"\b(\S+\.(?:log|txt|csv|json|md))\b", question, flags=re.I)
     return m.group(1) if m else None
 
-def build_smart_context(documents: list[str], max_chars: int = 75000) -> str:
-    """Combines documents until character limit is reached to avoid LLM overflow."""
-    context_parts = []
+
+def build_smart_context(
+    documents: list[str],
+    max_chars: int = MAX_TOTAL_CONTEXT_CHARS,
+    max_doc_chars: int = MAX_CHUNK_CHARS,
+    max_docs: int = MAX_CONTEXT_CHUNKS,
+) -> str:
+    """
+    Combines top documents until character limit is reached.
+    Also truncates each doc to avoid super-long single chunks.
+    """
+    context_parts: List[str] = []
     current_length = 0
-    for doc in documents:
-        # Add buffer of 50 chars for the separator
-        if current_length + len(doc) + 50 > max_chars:
+
+    for doc in (documents or [])[:max_docs]:
+        doc = (doc or "").strip()
+        if not doc:
+            continue
+
+        if len(doc) > max_doc_chars:
+            doc = doc[:max_doc_chars] + "…"
+
+        add_len = len(doc) + 50  # separator buffer
+        if current_length + add_len > max_chars:
             break
+
         context_parts.append(doc)
-        current_length += len(doc)
+        current_length += add_len
+
     return "\n\n---\n\n".join(context_parts)
 
-# ------------------------------------------------------------------------------
-# Core Endpoints
-# ------------------------------------------------------------------------------
 
-def iter_chunks_from_file(file_path: str, max_chars: int = 4000, overlap: int = 300):
+# ------------------------------------------------------------------------------
+# Core indexing helpers + endpoints
+# ------------------------------------------------------------------------------
+def iter_chunks_from_file(file_path: str, max_chars: int = 4000, overlap: int = 300) -> Iterator[str]:
     buf = ""
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             buf += line
             while len(buf) >= max_chars:
                 chunk = buf[:max_chars].strip()
-                if chunk: yield chunk
+                if chunk:
+                    yield chunk
                 buf = buf[max_chars - overlap :]
     tail = buf.strip()
-    if tail: yield tail
+    if tail:
+        yield tail
+
 
 def index_file_job(job_id: str, file_path: str, filename: str) -> None:
     try:
         UPLOAD_JOBS[job_id]["status"] = "running"
-        batch_ids, batch_metas, batch_docs, batch_embs = [], [], [], []
+        batch_ids: List[str] = []
+        batch_metas: List[Dict[str, Any]] = []
+        batch_docs: List[str] = []
+        batch_embs: List[List[float]] = []
         total = 0
+
         for ch in iter_chunks_from_file(file_path):
             total += 1
             UPLOAD_JOBS[job_id]["processed_chunks"] = total
+
             emb = bedrock_embed(ch)
-            if EMBED_DELAY_SECONDS > 0: time.sleep(EMBED_DELAY_SECONDS)
-            
+            if EMBED_DELAY_SECONDS > 0:
+                time.sleep(EMBED_DELAY_SECONDS)
+
             batch_ids.append(f"{filename}-{job_id}-{total}")
             batch_metas.append({"source": filename, "device": filename})
             batch_docs.append(ch)
@@ -179,11 +234,14 @@ def index_file_job(job_id: str, file_path: str, filename: str) -> None:
 
         if batch_ids:
             coll.add(ids=batch_ids, metadatas=batch_metas, documents=batch_docs, embeddings=batch_embs)
+
         UPLOAD_JOBS[job_id]["status"] = "done"
+
     except Exception as e:
         traceback.print_exc()
         UPLOAD_JOBS[job_id]["status"] = "failed"
         UPLOAD_JOBS[job_id]["message"] = str(e)
+
 
 @app.get("/sources")
 def sources():
@@ -191,50 +249,105 @@ def sources():
     files = sorted({m.get("source") for m in metas if isinstance(m, dict) and m.get("source")})
     return {"sources": files, "count": len(files)}
 
+
+@app.get("/upload_status/{job_id}")
+def upload_status(job_id: str):
+    job = UPLOAD_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_id not found")
+    return job
+
+
 @app.post("/upload")
 async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    content = await file.read()
-    uploads_dir = Path("uploads")
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    job_id = uuid.uuid4().hex
-    safe_name = Path(file.filename).name
-    file_path = str(uploads_dir / f"{job_id}__{safe_name}")
-    Path(file_path).write_bytes(content)
-    UPLOAD_JOBS[job_id] = {"status": "queued", "processed_chunks": 0}
-    background_tasks.add_task(index_file_job, job_id, file_path, safe_name)
-    return {"status": "accepted", "job_id": job_id}
+    try:
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        uploads_dir = Path("uploads")
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+
+        job_id = uuid.uuid4().hex
+        safe_name = Path(file.filename).name
+        file_path = str(uploads_dir / f"{job_id}__{safe_name}")
+
+        Path(file_path).write_bytes(content)
+
+        UPLOAD_JOBS[job_id] = {"status": "queued", "processed_chunks": 0, "file": safe_name}
+        background_tasks.add_task(index_file_job, job_id, file_path, safe_name)
+
+        return {"status": "accepted", "job_id": job_id, "file": safe_name}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/ask")
 def ask(req: Q):
     start = time.time()
     try:
         emb = bedrock_embed(req.q)
-        where = {}
-        if req.device: where["device"] = req.device
-        if req.source: where["source"] = req.source
-        elif _extract_filename(req.q): where["source"] = _extract_filename(req.q)
+
+        where: Dict[str, Any] = {}
+        if req.device:
+            where["device"] = req.device
+        if req.source:
+            where["source"] = req.source
+        else:
+            fname = _extract_filename(req.q)
+            if fname:
+                where["source"] = fname
 
         docs = coll.query(
             query_embeddings=[emb],
-            n_results=30,
+            n_results=CHROMA_N_RESULTS,
             where=where or None,
             include=["documents", "metadatas"],
         )
 
         if not docs.get("documents") or not docs["documents"][0]:
-            return {"answer": "No relevant logs found.", "sources": []}
+            return {
+                "answer": "No relevant logs found.",
+                "sources": [],
+                "timing": {"duration_ms": int((time.time() - start) * 1000)},
+            }
 
-        # --- SMART CONTEXT TRUNCATION ---
-        context = build_smart_context(docs["documents"][0], max_chars=75000)
+        # First attempt context (normal size)
+        context = build_smart_context(
+            docs["documents"][0],
+            max_chars=MAX_TOTAL_CONTEXT_CHARS,
+            max_doc_chars=MAX_CHUNK_CHARS,
+            max_docs=MAX_CONTEXT_CHUNKS,
+        )
         prompt = f"{SYS_PROMPT}\n\nLogs:\n{context}\n\nQ: {req.q}\nA:"
-        # --------------------------------
 
-        ans = bedrock_generate(prompt)
+        try:
+            ans = bedrock_generate(prompt)
+        except Exception as e:
+            msg = str(e)
+            if "maximum context length" in msg or "ValidationException" in msg:
+                # Retry with smaller context (REAL fallback)
+                context = build_smart_context(
+                    docs["documents"][0],
+                    max_chars=RETRY_MAX_TOTAL_CONTEXT_CHARS,
+                    max_doc_chars=RETRY_MAX_CHUNK_CHARS,
+                    max_docs=RETRY_MAX_CONTEXT_CHUNKS,
+                )
+                prompt = f"{SYS_PROMPT}\n\nLogs:\n{context}\n\nQ: {req.q}\nA:"
+                ans = bedrock_generate(prompt)
+            else:
+                raise
+
         return {
             "answer": ans,
-            "sources": docs["metadatas"][0][:len(context.split("---"))], # match sources to context used
+            "sources": docs["metadatas"][0],
             "timing": {"duration_ms": int((time.time() - start) * 1000)},
         }
+
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
