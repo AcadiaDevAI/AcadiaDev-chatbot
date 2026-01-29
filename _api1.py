@@ -1,8 +1,4 @@
-# api.py — Multi-file Log IQ backend (FastAPI + Bedrock + Chroma)
-# Updated to improve multi-file retrieval:
-# - Stores/uses per-chunk metadata: {"source": filename, "device": filename}
-# - Balanced retrieval across all uploaded files (prevents one huge file dominating)
-# - Returns sources actually used in the context ("View Evidence" aligns with answer)
+#multiple files functionality
 
 import os
 import re
@@ -11,8 +7,7 @@ import uuid
 import json
 import traceback
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Iterator, Tuple
-from collections import Counter
+from typing import List, Dict, Any, Optional, Iterator
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from pydantic import BaseModel
@@ -52,14 +47,17 @@ _bedrock = session.client("bedrock-runtime", config=boto_cfg)
 # ------------------------------------------------------------------------------
 # Tunables
 # ------------------------------------------------------------------------------
+# CHANGE #1: Reduced embed delay for faster indexing (was 0.10, now 0.05)
 EMBED_DELAY_SECONDS = float(os.getenv("EMBED_DELAY_SECONDS", "0.05"))
 MAX_THROTTLE_RETRIES = int(os.getenv("MAX_THROTTLE_RETRIES", "12"))
 BACKOFF_BASE_SECONDS = float(os.getenv("BACKOFF_BASE_SECONDS", "0.5"))
 BACKOFF_MAX_SECONDS = float(os.getenv("BACKOFF_MAX_SECONDS", "20"))
 
-# Retrieval / context controls
-CHROMA_N_RESULTS = int(os.getenv("CHROMA_N_RESULTS", "10"))  # overall cap
+# Context / prompt controls
+# CHANGE #2: Increased results to search across more files (was 6, now 10)
+CHROMA_N_RESULTS = int(os.getenv("CHROMA_N_RESULTS", "10"))
 MAX_TOTAL_CONTEXT_CHARS = int(os.getenv("MAX_TOTAL_CONTEXT_CHARS", "20000"))
+# CHANGE #3: Allow more chunks for multi-file correlation (was 6, now 10)
 MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", "10"))
 MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "1800"))
 
@@ -67,19 +65,7 @@ RETRY_MAX_TOTAL_CONTEXT_CHARS = int(os.getenv("RETRY_MAX_TOTAL_CONTEXT_CHARS", "
 RETRY_MAX_CONTEXT_CHUNKS = int(os.getenv("RETRY_MAX_CONTEXT_CHUNKS", "3"))
 RETRY_MAX_CHUNK_CHARS = int(os.getenv("RETRY_MAX_CHUNK_CHARS", "1200"))
 
-# Balanced retrieval knobs
-# Fetch per-file results and merge (prevents dominance by a giant file)
-BALANCED_TOTAL_CAP = int(os.getenv("BALANCED_TOTAL_CAP", str(CHROMA_N_RESULTS)))
-K_SMALL = int(os.getenv("K_PER_FILE_SMALL", "2"))
-K_MED = int(os.getenv("K_PER_FILE_MED", "4"))
-K_LARGE = int(os.getenv("K_PER_FILE_LARGE", "6"))
 
-SMALL_THRESHOLD = int(os.getenv("SMALL_CHUNK_THRESHOLD", "200"))
-MED_THRESHOLD = int(os.getenv("MED_CHUNK_THRESHOLD", "800"))
-
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
 def _is_throttle_error(err: Exception) -> bool:
     if not isinstance(err, ClientError):
         return False
@@ -152,7 +138,7 @@ def bedrock_generate(prompt: str, max_tokens: int = 512) -> str:
 
 
 # ------------------------------------------------------------------------------
-# Chroma & State
+# Chroma & Helpers
 # ------------------------------------------------------------------------------
 coll = get_collection()
 UPLOAD_JOBS: Dict[str, Dict[str, Any]] = {}
@@ -164,6 +150,7 @@ class Q(BaseModel):
     source: Optional[str] = None
 
 
+# CHANGE #4: Updated system prompt to support multi-file correlation
 SYS_PROMPT = (
     "You are a Cisco TAC engineer analyzing logs from multiple devices. "
     "Answer the question using the provided log fragments from various sources. "
@@ -173,38 +160,40 @@ SYS_PROMPT = (
 )
 
 
-def _extract_filename(question: str) -> Optional[str]:
+def _extract_filename(question: str) -> str | None:
     m = re.search(r"\b(\S+\.(?:log|txt|csv|json|md))\b", question, flags=re.I)
     return m.group(1) if m else None
 
 
+# CHANGE #5: Enhanced context builder to show file sources clearly
 def build_smart_context(
-    documents: List[str],
-    metadatas: List[Dict[str, Any]],
+    documents: list[str],
+    metadatas: list[dict],
     max_chars: int = MAX_TOTAL_CONTEXT_CHARS,
     max_doc_chars: int = MAX_CHUNK_CHARS,
     max_docs: int = MAX_CONTEXT_CHUNKS,
-) -> Tuple[str, List[str], int]:
+) -> str:
     """
-    Combines docs until character limit. Adds [Source: X] header per chunk.
-    Returns (context_string, sources_used, chunks_used)
+    Combines top documents until character limit is reached.
+    Now includes source information for multi-file correlation.
     """
     context_parts: List[str] = []
     current_length = 0
-    used_sources: List[str] = []
-    used_chunks = 0
 
     for idx, doc in enumerate((documents or [])[:max_docs]):
         doc = (doc or "").strip()
         if not doc:
             continue
 
+        # Get source info from metadata
         meta = metadatas[idx] if idx < len(metadatas) else {}
         source = meta.get("source", "unknown")
+        device = meta.get("device", source)
 
         if len(doc) > max_doc_chars:
             doc = doc[:max_doc_chars] + "…"
 
+        # Add source header for context
         doc_with_source = f"[Source: {source}]\n{doc}"
         add_len = len(doc_with_source) + 50
 
@@ -213,20 +202,12 @@ def build_smart_context(
 
         context_parts.append(doc_with_source)
         current_length += add_len
-        used_sources.append(source)
-        used_chunks += 1
 
-    # unique but stable ordering
-    uniq_sources = []
-    for s in used_sources:
-        if s not in uniq_sources:
-            uniq_sources.append(s)
-
-    return "\n\n---\n\n".join(context_parts), uniq_sources, used_chunks
+    return "\n\n---\n\n".join(context_parts)
 
 
 # ------------------------------------------------------------------------------
-# Indexing helpers
+# Core indexing helpers + endpoints
 # ------------------------------------------------------------------------------
 def iter_chunks_from_file(file_path: str, max_chars: int = 4000, overlap: int = 300) -> Iterator[str]:
     buf = ""
@@ -244,29 +225,43 @@ def iter_chunks_from_file(file_path: str, max_chars: int = 4000, overlap: int = 
 
 
 def clear_collection() -> None:
-    """Deletes ALL data from the collection."""
+    """
+    Deletes ALL data from the collection.
+    Use the /clear endpoint to start fresh with no files.
+    """
     try:
         all_data = coll.get(include=[])
         all_ids = all_data.get("ids", [])
+        
         if all_ids:
             batch_size = 5000
             for i in range(0, len(all_ids), batch_size):
-                coll.delete(ids=all_ids[i : i + batch_size])
+                batch = all_ids[i:i + batch_size]
+                coll.delete(ids=batch)
             print(f"Cleared {len(all_ids)} vectors from collection")
     except Exception as e:
         print(f"Error clearing collection: {e}")
         raise
 
 
+# CHANGE #6: New function to delete specific file
 def delete_file_from_collection(filename: str) -> int:
-    """Deletes all chunks from a specific file; returns number deleted."""
+    """
+    Deletes all chunks from a specific file.
+    Returns the number of chunks deleted.
+    """
     try:
-        results = coll.get(where={"source": filename}, include=[])
+        results = coll.get(
+            where={"source": filename},
+            include=[]
+        )
         ids_to_delete = results.get("ids", [])
+        
         if ids_to_delete:
             batch_size = 5000
             for i in range(0, len(ids_to_delete), batch_size):
-                coll.delete(ids=ids_to_delete[i : i + batch_size])
+                batch = ids_to_delete[i:i + batch_size]
+                coll.delete(ids=batch)
             print(f"Deleted {len(ids_to_delete)} vectors from {filename}")
             return len(ids_to_delete)
         return 0
@@ -275,123 +270,17 @@ def delete_file_from_collection(filename: str) -> int:
         raise
 
 
-def _get_sources_and_counts() -> Tuple[List[str], Dict[str, int]]:
-    """
-    Reads metadatas and returns (sources_sorted, counts_per_source).
-    Works dynamically—no hardcoded filenames.
-    """
-    metas = coll.get(include=["metadatas"]).get("metadatas") or []
-    counts: Dict[str, int] = {}
-    for m in metas:
-        if isinstance(m, dict) and m.get("source"):
-            s = m["source"]
-            counts[s] = counts.get(s, 0) + 1
-    sources = sorted(counts.keys())
-    return sources, counts
-
-
-def _k_for_source(source: str, counts: Dict[str, int]) -> int:
-    n = counts.get(source, 0)
-    if n < SMALL_THRESHOLD:
-        return K_SMALL
-    if n < MED_THRESHOLD:
-        return K_MED
-    return K_LARGE
-
-
-def _balanced_query(
-    query_embedding: List[float],
-    where_base: Optional[Dict[str, Any]] = None,
-    total_cap: int = BALANCED_TOTAL_CAP,
-) -> Dict[str, Any]:
-    """
-    Balanced multi-file retrieval:
-    - If where_base already specifies "source", do normal retrieval.
-    - Otherwise, retrieve top-k per source and merge, then sort by distance.
-    Returns a doc-like structure similar to coll.query output (documents, metadatas, distances).
-    """
-    where_base = where_base or {}
-
-    # If user explicitly filters to a single source, no need for balanced merge.
-    if "source" in where_base and where_base["source"]:
-        return coll.query(
-            query_embeddings=[query_embedding],
-            n_results=total_cap,
-            where=where_base,
-            include=["documents", "metadatas", "distances"],
-        )
-
-    sources, counts = _get_sources_and_counts()
-
-    # If only 0 or 1 source exists, do a single query (fast path).
-    if len(sources) <= 1:
-        return coll.query(
-            query_embeddings=[query_embedding],
-            n_results=total_cap,
-            where=where_base or None,
-            include=["documents", "metadatas", "distances"],
-        )
-
-    merged: List[Tuple[float, str, Dict[str, Any]]] = []
-
-    for src in sources:
-        k = _k_for_source(src, counts)
-
-        where = dict(where_base)
-        where["source"] = src
-
-        res = coll.query(
-            query_embeddings=[query_embedding],
-            n_results=k,
-            where=where,
-            include=["documents", "metadatas", "distances"],
-        )
-
-        docs = (res.get("documents") or [[]])[0]
-        metas = (res.get("metadatas") or [[]])[0]
-        dists = (res.get("distances") or [[]])[0]
-
-        for i in range(min(len(docs), len(metas), len(dists))):
-            doc = docs[i]
-            meta = metas[i] if isinstance(metas[i], dict) else {}
-            dist = dists[i] if isinstance(dists[i], (int, float)) else 1e9
-            merged.append((dist, doc, meta))
-
-    # Sort by distance (smaller = more similar)
-    merged.sort(key=lambda x: x[0])
-
-    # Deduplicate near-identical chunks (simple exact match) to improve diversity
-    seen = set()
-    filtered: List[Tuple[float, str, Dict[str, Any]]] = []
-    for dist, doc, meta in merged:
-        key = (meta.get("source", ""), doc[:200])  # cheap signature
-        if key in seen:
-            continue
-        seen.add(key)
-        filtered.append((dist, doc, meta))
-        if len(filtered) >= total_cap:
-            break
-
-    out_docs = [d for _, d, _ in filtered]
-    out_metas = [m for _, _, m in filtered]
-    out_dists = [dist for dist, _, _ in filtered]
-
-    return {"documents": [out_docs], "metadatas": [out_metas], "distances": [out_dists]}
-
-
-# ------------------------------------------------------------------------------
-# Indexing job
-# ------------------------------------------------------------------------------
+# CHANGE #7: REMOVED clear_collection() call - now keeps all files!
 def index_file_job(job_id: str, file_path: str, filename: str) -> None:
     try:
         UPLOAD_JOBS[job_id]["status"] = "running"
-
-        # If same filename exists, replace it
-        existing_ids = coll.get(where={"source": filename}, include=[]).get("ids", [])
-        if existing_ids:
+        
+        # Check if this file already exists and delete old version
+        existing = coll.get(where={"source": filename}, limit=1).get("ids")
+        if existing:
             print(f"File {filename} already exists, replacing...")
             delete_file_from_collection(filename)
-
+        
         batch_ids: List[str] = []
         batch_metas: List[Dict[str, Any]] = []
         batch_docs: List[str] = []
@@ -406,9 +295,7 @@ def index_file_job(job_id: str, file_path: str, filename: str) -> None:
             if EMBED_DELAY_SECONDS > 0:
                 time.sleep(EMBED_DELAY_SECONDS)
 
-            # IMPORTANT: attach per-chunk metadata ("source") for multi-file retrieval
-            chunk_id = f"{filename}-{job_id}-{total}"
-            batch_ids.append(chunk_id)
+            batch_ids.append(f"{filename}-{job_id}-{total}")
             batch_metas.append({"source": filename, "device": filename})
             batch_docs.append(ch)
             batch_embs.append(emb)
@@ -429,46 +316,61 @@ def index_file_job(job_id: str, file_path: str, filename: str) -> None:
         UPLOAD_JOBS[job_id]["message"] = str(e)
 
 
-# ------------------------------------------------------------------------------
-# Endpoints
-# ------------------------------------------------------------------------------
 @app.get("/sources")
 def sources():
+    """
+    CHANGE #8: Enhanced to show chunk counts per file
+    """
     metas = coll.get(include=["metadatas"]).get("metadatas") or []
-    source_counts: Dict[str, int] = {}
+    
+    # Count chunks per source
+    source_counts = {}
     for m in metas:
         if isinstance(m, dict) and m.get("source"):
-            s = m["source"]
-            source_counts[s] = source_counts.get(s, 0) + 1
+            source = m["source"]
+            source_counts[source] = source_counts.get(source, 0) + 1
+    
     files = sorted(source_counts.keys())
     return {
         "sources": files,
         "count": len(files),
         "details": source_counts,
-        "total_chunks": coll.count(),
+        "total_chunks": coll.count()
     }
 
 
 @app.post("/clear")
 def clear_all_data():
+    """
+    CHANGE #9: Added warning about clearing all files
+    """
     try:
         count = coll.count()
         clear_collection()
         return {
-            "status": "success",
-            "message": f"Cleared all data from collection ({count} chunks removed)",
+            "status": "success", 
+            "message": f"Cleared all data from collection ({count} chunks removed)"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# CHANGE #10: New endpoint to delete specific file
 @app.delete("/sources/{filename}")
 def delete_source(filename: str):
+    """
+    Delete a specific file from the collection.
+    Allows removing individual files while keeping others.
+    """
     try:
         count = delete_file_from_collection(filename)
         if count == 0:
             raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
-        return {"status": "success", "file": filename, "deleted_chunks": count}
+        return {
+            "status": "success",
+            "file": filename,
+            "deleted_chunks": count
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -496,6 +398,7 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
         job_id = uuid.uuid4().hex
         safe_name = Path(file.filename).name
         file_path = str(uploads_dir / f"{job_id}__{safe_name}")
+
         Path(file_path).write_bytes(content)
 
         UPLOAD_JOBS[job_id] = {"status": "queued", "processed_chunks": 0, "file": safe_name}
@@ -510,45 +413,45 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# CHANGE #11: Enhanced /ask endpoint for multi-file correlation
 @app.post("/ask")
 def ask(req: Q):
     start = time.time()
     try:
         emb = bedrock_embed(req.q)
 
-        # Base filters (optional)
+        # CHANGE #12: Don't filter by source unless explicitly requested
         where: Dict[str, Any] = {}
         if req.device:
             where["device"] = req.device
         if req.source:
             where["source"] = req.source
+        # Removed automatic filename extraction - search ALL files by default
 
-        # Balanced retrieval across ALL files unless source explicitly requested
-        docs = _balanced_query(
-            query_embedding=emb,
-            where_base=where or None,
-            total_cap=BALANCED_TOTAL_CAP,
+        docs = coll.query(
+            query_embeddings=[emb],
+            n_results=CHROMA_N_RESULTS,
+            where=where or None,
+            include=["documents", "metadatas"],
         )
 
-        documents = (docs.get("documents") or [[]])[0]
-        metadatas = (docs.get("metadatas") or [[]])[0]
-
-        if not documents:
+        if not docs.get("documents") or not docs["documents"][0]:
             return {
                 "answer": "No relevant logs found.",
                 "sources": [],
-                "sources_count": 0,
                 "timing": {"duration_ms": int((time.time() - start) * 1000)},
             }
 
-        context, used_sources, used_chunks = build_smart_context(
-            documents,
-            metadatas,
+        # CHANGE #13: Pass metadatas to context builder for source labels
+        context = build_smart_context(
+            docs["documents"][0],
+            docs["metadatas"][0],
             max_chars=MAX_TOTAL_CONTEXT_CHARS,
             max_doc_chars=MAX_CHUNK_CHARS,
             max_docs=MAX_CONTEXT_CHUNKS,
         )
-
+        
+        # CHANGE #14: Enhanced prompt to encourage correlation
         prompt = (
             f"{SYS_PROMPT}\n\n"
             f"Logs from multiple devices:\n{context}\n\n"
@@ -561,9 +464,9 @@ def ask(req: Q):
         except Exception as e:
             msg = str(e)
             if "maximum context length" in msg or "ValidationException" in msg:
-                context, used_sources, used_chunks = build_smart_context(
-                    documents,
-                    metadatas,
+                context = build_smart_context(
+                    docs["documents"][0],
+                    docs["metadatas"][0],
                     max_chars=RETRY_MAX_TOTAL_CONTEXT_CHARS,
                     max_doc_chars=RETRY_MAX_CHUNK_CHARS,
                     max_docs=RETRY_MAX_CONTEXT_CHUNKS,
@@ -577,12 +480,13 @@ def ask(req: Q):
             else:
                 raise
 
+        # CHANGE #15: Return unique sources for the answer
+        unique_sources = list(set(m.get("source", "unknown") for m in docs["metadatas"][0]))
+        
         return {
             "answer": ans,
-            # IMPORTANT: sources returned are the ones actually included in the context
-            "sources": used_sources,
-            "sources_count": len(used_sources),
-            "chunks_used": used_chunks,
+            "sources": unique_sources,
+            "sources_count": len(unique_sources),
             "timing": {"duration_ms": int((time.time() - start) * 1000)},
         }
 
