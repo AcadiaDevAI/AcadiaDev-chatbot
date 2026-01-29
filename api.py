@@ -1,4 +1,3 @@
-#multiple file implementation
 import os
 import re
 import time
