@@ -1,4 +1,3 @@
-#multiple file implementation
 import os
 import re
 import time
@@ -46,18 +45,15 @@ _bedrock = session.client("bedrock-runtime", config=boto_cfg)
 # ------------------------------------------------------------------------------
 # Tunables
 # ------------------------------------------------------------------------------
-# CHANGE #1: Reduced embed delay for faster indexing (was 0.10, now 0.05)
-EMBED_DELAY_SECONDS = float(os.getenv("EMBED_DELAY_SECONDS", "0.05"))
+EMBED_DELAY_SECONDS = float(os.getenv("EMBED_DELAY_SECONDS", "0.10"))
 MAX_THROTTLE_RETRIES = int(os.getenv("MAX_THROTTLE_RETRIES", "12"))
 BACKOFF_BASE_SECONDS = float(os.getenv("BACKOFF_BASE_SECONDS", "0.5"))
 BACKOFF_MAX_SECONDS = float(os.getenv("BACKOFF_MAX_SECONDS", "20"))
 
 # Context / prompt controls
-# CHANGE #2: Increased results to search across more files (was 6, now 10)
-CHROMA_N_RESULTS = int(os.getenv("CHROMA_N_RESULTS", "10"))
+CHROMA_N_RESULTS = int(os.getenv("CHROMA_N_RESULTS", "6"))
 MAX_TOTAL_CONTEXT_CHARS = int(os.getenv("MAX_TOTAL_CONTEXT_CHARS", "20000"))
-# CHANGE #3: Allow more chunks for multi-file correlation (was 6, now 10)
-MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", "10"))
+MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", "6"))
 MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "1800"))
 
 RETRY_MAX_TOTAL_CONTEXT_CHARS = int(os.getenv("RETRY_MAX_TOTAL_CONTEXT_CHARS", "9000"))
@@ -149,12 +145,9 @@ class Q(BaseModel):
     source: Optional[str] = None
 
 
-# CHANGE #4: Updated system prompt to support multi-file correlation
 SYS_PROMPT = (
-    "You are a Cisco TAC engineer analyzing logs from multiple devices. "
-    "Answer the question using the provided log fragments from various sources. "
-    "When logs from different devices show related events, identify the correlation. "
-    "Cite which device/source each piece of evidence comes from. "
+    "You are a Cisco TAC engineer. "
+    "Answer the question using ONLY the provided log fragments. "
     "If the logs do not contain enough evidence, say what is missing."
 )
 
@@ -164,42 +157,32 @@ def _extract_filename(question: str) -> str | None:
     return m.group(1) if m else None
 
 
-# CHANGE #5: Enhanced context builder to show file sources clearly
 def build_smart_context(
     documents: list[str],
-    metadatas: list[dict],
     max_chars: int = MAX_TOTAL_CONTEXT_CHARS,
     max_doc_chars: int = MAX_CHUNK_CHARS,
     max_docs: int = MAX_CONTEXT_CHUNKS,
 ) -> str:
     """
     Combines top documents until character limit is reached.
-    Now includes source information for multi-file correlation.
+    Also truncates each doc to avoid super-long single chunks.
     """
     context_parts: List[str] = []
     current_length = 0
 
-    for idx, doc in enumerate((documents or [])[:max_docs]):
+    for doc in (documents or [])[:max_docs]:
         doc = (doc or "").strip()
         if not doc:
             continue
 
-        # Get source info from metadata
-        meta = metadatas[idx] if idx < len(metadatas) else {}
-        source = meta.get("source", "unknown")
-        device = meta.get("device", source)
-
         if len(doc) > max_doc_chars:
             doc = doc[:max_doc_chars] + "…"
 
-        # Add source header for context
-        doc_with_source = f"[Source: {source}]\n{doc}"
-        add_len = len(doc_with_source) + 50
-
+        add_len = len(doc) + 50  # separator buffer
         if current_length + add_len > max_chars:
             break
 
-        context_parts.append(doc_with_source)
+        context_parts.append(doc)
         current_length += add_len
 
     return "\n\n---\n\n".join(context_parts)
@@ -226,13 +209,15 @@ def iter_chunks_from_file(file_path: str, max_chars: int = 4000, overlap: int = 
 def clear_collection() -> None:
     """
     Deletes ALL data from the collection.
-    Use the /clear endpoint to start fresh with no files.
+    Call this before indexing a new file if you want ONLY the new file's data.
     """
     try:
+        # Get all IDs in the collection
         all_data = coll.get(include=[])
         all_ids = all_data.get("ids", [])
         
         if all_ids:
+            # Delete in batches (ChromaDB limit ~5000 per delete)
             batch_size = 5000
             for i in range(0, len(all_ids), batch_size):
                 batch = all_ids[i:i + batch_size]
@@ -243,42 +228,13 @@ def clear_collection() -> None:
         raise
 
 
-# CHANGE #6: New function to delete specific file
-def delete_file_from_collection(filename: str) -> int:
-    """
-    Deletes all chunks from a specific file.
-    Returns the number of chunks deleted.
-    """
-    try:
-        results = coll.get(
-            where={"source": filename},
-            include=[]
-        )
-        ids_to_delete = results.get("ids", [])
-        
-        if ids_to_delete:
-            batch_size = 5000
-            for i in range(0, len(ids_to_delete), batch_size):
-                batch = ids_to_delete[i:i + batch_size]
-                coll.delete(ids=batch)
-            print(f"Deleted {len(ids_to_delete)} vectors from {filename}")
-            return len(ids_to_delete)
-        return 0
-    except Exception as e:
-        print(f"Error deleting {filename}: {e}")
-        raise
-
-
-# CHANGE #7: REMOVED clear_collection() call - now keeps all files!
 def index_file_job(job_id: str, file_path: str, filename: str) -> None:
     try:
         UPLOAD_JOBS[job_id]["status"] = "running"
         
-        # Check if this file already exists and delete old version
-        existing = coll.get(where={"source": filename}, limit=1).get("ids")
-        if existing:
-            print(f"File {filename} already exists, replacing...")
-            delete_file_from_collection(filename)
+        # CRITICAL: Clear old data before indexing new file
+        # This ensures only the NEW file's data is searchable
+        clear_collection()
         
         batch_ids: List[str] = []
         batch_metas: List[Dict[str, Any]] = []
@@ -307,7 +263,6 @@ def index_file_job(job_id: str, file_path: str, filename: str) -> None:
             coll.add(ids=batch_ids, metadatas=batch_metas, documents=batch_docs, embeddings=batch_embs)
 
         UPLOAD_JOBS[job_id]["status"] = "done"
-        print(f"Successfully indexed {filename} with {total} chunks")
 
     except Exception as e:
         traceback.print_exc()
@@ -317,61 +272,20 @@ def index_file_job(job_id: str, file_path: str, filename: str) -> None:
 
 @app.get("/sources")
 def sources():
-    """
-    CHANGE #8: Enhanced to show chunk counts per file
-    """
     metas = coll.get(include=["metadatas"]).get("metadatas") or []
-    
-    # Count chunks per source
-    source_counts = {}
-    for m in metas:
-        if isinstance(m, dict) and m.get("source"):
-            source = m["source"]
-            source_counts[source] = source_counts.get(source, 0) + 1
-    
-    files = sorted(source_counts.keys())
-    return {
-        "sources": files,
-        "count": len(files),
-        "details": source_counts,
-        "total_chunks": coll.count()
-    }
+    files = sorted({m.get("source") for m in metas if isinstance(m, dict) and m.get("source")})
+    return {"sources": files, "count": len(files)}
 
 
 @app.post("/clear")
 def clear_all_data():
     """
-    CHANGE #9: Added warning about clearing all files
+    Endpoint to manually clear all data from the vector store.
+    Useful for testing or starting fresh.
     """
     try:
-        count = coll.count()
         clear_collection()
-        return {
-            "status": "success", 
-            "message": f"Cleared all data from collection ({count} chunks removed)"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# CHANGE #10: New endpoint to delete specific file
-@app.delete("/sources/{filename}")
-def delete_source(filename: str):
-    """
-    Delete a specific file from the collection.
-    Allows removing individual files while keeping others.
-    """
-    try:
-        count = delete_file_from_collection(filename)
-        if count == 0:
-            raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
-        return {
-            "status": "success",
-            "file": filename,
-            "deleted_chunks": count
-        }
-    except HTTPException:
-        raise
+        return {"status": "success", "message": "All data cleared from collection"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -412,20 +326,21 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# CHANGE #11: Enhanced /ask endpoint for multi-file correlation
 @app.post("/ask")
 def ask(req: Q):
     start = time.time()
     try:
         emb = bedrock_embed(req.q)
 
-        # CHANGE #12: Don't filter by source unless explicitly requested
         where: Dict[str, Any] = {}
         if req.device:
             where["device"] = req.device
         if req.source:
             where["source"] = req.source
-        # Removed automatic filename extraction - search ALL files by default
+        else:
+            fname = _extract_filename(req.q)
+            if fname:
+                where["source"] = fname
 
         docs = coll.query(
             query_embeddings=[emb],
@@ -441,51 +356,35 @@ def ask(req: Q):
                 "timing": {"duration_ms": int((time.time() - start) * 1000)},
             }
 
-        # CHANGE #13: Pass metadatas to context builder for source labels
+        # First attempt context (normal size)
         context = build_smart_context(
             docs["documents"][0],
-            docs["metadatas"][0],
             max_chars=MAX_TOTAL_CONTEXT_CHARS,
             max_doc_chars=MAX_CHUNK_CHARS,
             max_docs=MAX_CONTEXT_CHUNKS,
         )
-        
-        # CHANGE #14: Enhanced prompt to encourage correlation
-        prompt = (
-            f"{SYS_PROMPT}\n\n"
-            f"Logs from multiple devices:\n{context}\n\n"
-            f"Question: {req.q}\n"
-            f"Answer (cite sources):"
-        )
+        prompt = f"{SYS_PROMPT}\n\nLogs:\n{context}\n\nQ: {req.q}\nA:"
 
         try:
             ans = bedrock_generate(prompt)
         except Exception as e:
             msg = str(e)
             if "maximum context length" in msg or "ValidationException" in msg:
+                # Retry with smaller context (REAL fallback)
                 context = build_smart_context(
                     docs["documents"][0],
-                    docs["metadatas"][0],
                     max_chars=RETRY_MAX_TOTAL_CONTEXT_CHARS,
                     max_doc_chars=RETRY_MAX_CHUNK_CHARS,
                     max_docs=RETRY_MAX_CONTEXT_CHUNKS,
                 )
-                prompt = (
-                    f"{SYS_PROMPT}\n\n"
-                    f"Logs:\n{context}\n\n"
-                    f"Q: {req.q}\nA:"
-                )
+                prompt = f"{SYS_PROMPT}\n\nLogs:\n{context}\n\nQ: {req.q}\nA:"
                 ans = bedrock_generate(prompt)
             else:
                 raise
 
-        # CHANGE #15: Return unique sources for the answer
-        unique_sources = list(set(m.get("source", "unknown") for m in docs["metadatas"][0]))
-        
         return {
             "answer": ans,
-            "sources": unique_sources,
-            "sources_count": len(unique_sources),
+            "sources": docs["metadatas"][0],
             "timing": {"duration_ms": int((time.time() - start) * 1000)},
         }
 
