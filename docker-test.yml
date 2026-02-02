@@ -1,0 +1,107 @@
+name: Docker Build & Health Check
+
+# Runs automatically on every push and pull request to main
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+
+
+    steps:
+      # 1. Pull your code from the repo
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Build the API image using your dockerfile.api
+      - name: Build API image
+        run: docker build -f dockerfile.api -t acadia-api .
+
+      # 3. Build the UI image using your dockerfile.ui
+      - name: Build UI image
+        run: docker build -f dockerfile.ui -t acadia-ui .
+
+      # 4. Start ONLY the API container (no need to spin up ChromaDB or Bedrock)
+      #    We set dummy env vars so config.py doesn't crash on missing values.
+      #    --detach runs it in the background so the next step can run.
+      - name: Start API container
+        run: |
+          docker run --detach \
+            --name api-test \
+            --publish 8000:8000 \
+            -e AWS_REGION=us-east-1 \
+            -e CHROMA_PERSIST_DIR=/app/data/chroma \
+            -e UPLOAD_DIR=/app/uploads \
+            -e BEDROCK_EMBED_MODEL=amazon.titan-embed-text-v2:0 \
+            -e BEDROCK_LLM_MODEL=mistral.mistral-7b-instruct-v0:2 \
+            -e LOG_LEVEL=INFO \
+            acadia-api
+
+      # 5. Wait for the container to actually start up.
+      #    FastAPI + ChromaDB init can take a few seconds.
+      - name: Wait for API to start
+        run: |
+          echo "Waiting for API to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health; then
+              echo ""
+              echo "API is up!"
+              exit 0
+            fi
+            echo "Attempt $i/30 — retrying in 2 seconds..."
+            sleep 2
+          done
+          echo "API did not start in 60 seconds"
+          exit 1
+
+      # 6. Run the actual health check and print the response
+      - name: Health check
+        run: |
+          echo "Running health check..."
+          curl -sf http://localhost:8000/health | python3 -m json.tool
+
+      # 7. Test that the /upload endpoint rejects bad files (no valid file sent)
+      - name: Test upload validation
+        run: |
+          echo "Testing upload validation..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST http://localhost:8000/upload \
+            -F "file=@dockerfile.api;filename=test.exe" \
+            -F "file_type=log")
+          echo "Response status: $STATUS"
+          if [ "$STATUS" = "400" ]; then
+            echo "✅ Correctly rejected invalid file type"
+          else
+            echo "❌ Expected 400, got $STATUS"
+            exit 1
+          fi
+
+      # 8. Test that /ask rejects an empty question
+      - name: Test ask validation
+        run: |
+          echo "Testing ask validation..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST http://localhost:8000/ask \
+            -H "Content-Type: application/json" \
+            -d '{"q": "   "}')
+          echo "Response status: $STATUS"
+          if [ "$STATUS" = "422" ]; then
+            echo "✅ Correctly rejected empty question"
+          else
+            echo "❌ Expected 422, got $STATUS"
+            exit 1
+          fi
+
+      # 9. Always print container logs — useful for debugging if something fails
+      - name: Print API logs (always runs, even on failure)
+        if: always()
+        run: docker logs api-test
+
+      # 10. Clean up — stop and remove the container
+      - name: Cleanup
+        if: always()
+        run: docker rm -f api-test
