@@ -1,5 +1,3 @@
-#multiple files functionality 
-
 import os
 import time
 import requests

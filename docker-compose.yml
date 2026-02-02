@@ -1,25 +1,54 @@
+version: "3.8"
+
 services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile.api
+      dockerfile: dockerfile.api
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
-      - CHROMA_PERSIST_DIR=/data/chroma
+      - CHROMA_PERSIST_DIR=/app/data/chroma
+      - UPLOAD_DIR=/app/uploads
+      - PYTHONUNBUFFERED=1
     volumes:
-      - ./data/chroma:/data/chroma
+      - chroma_data:/app/data/chroma
+      - uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - app-network
 
   ui:
     build:
       context: .
-      dockerfile: Dockerfile.ui
+      dockerfile: dockerfile.ui
     ports:
       - "8501:8501"
     environment:
       - API_BASE=http://api:8000
+      - PYTHONUNBUFFERED=1
+      - STREAMLIT_SERVER_MAX_UPLOAD_SIZE=200
+    env_file:
+      - .env
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - app-network
 
+volumes:
+  chroma_data:
+  uploads:
+
+networks:
+  app-network:
+    driver: bridge

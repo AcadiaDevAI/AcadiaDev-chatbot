@@ -1,11 +1,25 @@
+import os
+from typing import Any
 
 import chromadb
-from config import CHROMA_PERSIST_DIR, COLLECTION_NAME
 
-def get_collection():
-    """
-    Returns the persistent Chroma collection. 
-    Using a persistent client prevents data loss between restarts.
-    """
-    client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
-    return client.get_or_create_collection(name=COLLECTION_NAME)
+from config import settings
+
+
+def get_collection() -> Any:
+    """Return a persistent Chroma collection."""
+    chroma_path = settings.CHROMA_PERSIST_DIR
+    os.makedirs(chroma_path, exist_ok=True)
+
+    client = chromadb.PersistentClient(
+        path=chroma_path,
+        settings=chromadb.Settings(
+            anonymized_telemetry=False,
+            allow_reset=True,
+        ),
+    )
+
+    return client.get_or_create_collection(
+        name=settings.COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
