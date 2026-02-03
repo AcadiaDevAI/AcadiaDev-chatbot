@@ -1,363 +1,356 @@
+import json
 import os
+import sys
 import time
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, TypedDict
+from urllib.parse import urljoin
+
 import requests
 import streamlit as st
 
-# Docker-friendly default
-API_BASE = os.getenv("API_BASE", "http://api:8000")
+
+if sys.version_info < (3, 11):
+    st.error("âš ï¸ This application requires Python 3.11 or higher")
+    st.stop()
+
 
 st.set_page_config(
     page_title="Acadia's Log IQ",
+    page_icon="ðŸ”",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Styling for sidebar buttons
-st.markdown(
-    """
-<style>
-/* Sidebar file-uploader "Browse files" button */
-[data-testid="stSidebar"] [data-testid="stFileUploader"] button {
-    background-color: #4da6ff !important;
-    color: #ffffff !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-weight: 600 !important;
-    padding: 0.5rem 1rem !important;
-}
-
-/* Hover */
-[data-testid="stSidebar"] [data-testid="stFileUploader"] button:hover {
-    background-color: #1e88ff !important;
-    color: #ffffff !important;
-}
-
-/* Optional: remove default white box feel */
-[data-testid="stSidebar"] [data-testid="stFileUploader"] section {
-    background: transparent !important;
-    border: 1px dashed rgba(77, 166, 255, 0.6) !important;
-}
-</style>
-""",
-    unsafe_allow_html=True
-)
-
-# App Header
-st.title("📁 Acadia's Log IQ")
-st.caption("High-speed AI-powered log analysis and vector indexing.")
+API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+API_KEY = os.getenv("UI_API_KEY", "")
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 
 
-# Helper Functions
-def safe_get_json(url: str, timeout: int = 5):
+class ChatMessage(TypedDict, total=False):
+    role: str
+    content: str
+    timestamp: str
+    sources: Dict[str, list]
+
+
+class UploadedFile(TypedDict, total=False):
+    name: str
+    type: str
+    size_mb: float
+    uploaded_at: str
+
+
+class JobStatus(TypedDict, total=False):
+    job_id: str
+    status: str
+    processed_chunks: int
+    total_chunks: Optional[int]
+    successful_chunks: Optional[int]
+    file: Optional[str]
+    file_type: Optional[str]
+    error: Optional[str]
+    created_at: str
+
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # list[ChatMessage]
+
+if "uploaded_files" not in st.session_state:
+    st.session_state.uploaded_files = {"log": None, "kb": None}
+
+if "jobs" not in st.session_state:
+    st.session_state.jobs = {}
+
+if "api_health" not in st.session_state:
+    st.session_state.api_health = None
+
+
+def make_request(method: str, endpoint: str, **kwargs) -> Optional[Dict[str, Any]]:
     try:
-        r = requests.get(url, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return None
+        headers = kwargs.pop("headers", {})
+        if API_KEY:
+            headers["X-API-Key"] = API_KEY
 
+        headers["X-Request-ID"] = str(int(time.time() * 1000))
 
-def safe_post_json(url: str, payload: dict, timeout: int = 60):
-    try:
-        r = requests.post(url, json=payload, timeout=timeout)
-        return r
+        url = urljoin(API_BASE, endpoint)
+
+        if method.upper() == "GET":
+            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, **kwargs)
+        elif method.upper() == "POST":
+            resp = requests.post(url, headers=headers, timeout=REQUEST_TIMEOUT, **kwargs)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.Timeout:
+        st.error("â° Request timed out. The server is taking too long to respond.")
+        return None
+    except requests.exceptions.ConnectionError:
+        st.error("ðŸ”Œ Connection error. Please check if the API server is running.")
+        return None
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response else "Unknown"
+        st.error(f"ðŸš« HTTP Error: {code}")
+        try:
+            st.json(e.response.json())
+        except Exception:
+            pass
+        return None
+    except json.JSONDecodeError:
+        st.error("ðŸ“„ Invalid response format from server.")
+        return None
     except Exception as e:
-        return e
-
-
-def safe_post_file(url: str, filename: str, data: bytes, timeout: int = 60):
-    try:
-        files = {"file": (filename, data)}
-        r = requests.post(url, files=files, timeout=timeout)
-        return r
-    except Exception as e:
-        return e
-
-
-def fetch_sources():
-    """Fetch all indexed sources from the API"""
-    data = safe_get_json(f"{API_BASE}/sources", timeout=5)
-    if not data:
-        return []
-    return data.get("sources", [])
-
-
-def fetch_sources_detailed():
-    """Fetch detailed source information including chunk counts"""
-    data = safe_get_json(f"{API_BASE}/sources", timeout=5)
-    return data or {"sources": [], "count": 0, "details": {}, "total_chunks": 0}
-
-
-def fetch_job_status(job_id: str):
-    data = safe_get_json(f"{API_BASE}/upload_status/{job_id}", timeout=5)
-    return data or {"status": "unknown", "message": "No response from server."}
-
-
-def delete_source(filename: str):
-    """Delete a specific source file"""
-    try:
-        r = requests.delete(f"{API_BASE}/sources/{filename}", timeout=10)
-        if r.status_code == 200:
-            return r.json()
-        return None
-    except Exception:
+        st.error(f"âŒ Unexpected error: {e}")
         return None
 
 
-def clear_all_sources():
-    """Clear all indexed data"""
-    try:
-        r = requests.post(f"{API_BASE}/clear", timeout=10)
-        if r.status_code == 200:
-            return r.json()
-        return None
-    except Exception:
-        return None
+def poll_job(job_id: str, bar, text, timeout_s: int = 300) -> Optional[Dict[str, Any]]:
+    start = time.time()
+    while time.time() - start < timeout_s:
+        status = make_request("GET", f"/upload_status/{job_id}")
+        if not status:
+            return None
+
+        st.session_state.jobs[job_id] = status
+
+        state = status.get("status", "unknown")
+        processed = int(status.get("processed_chunks", 0) or 0)
+        total = int(status.get("total_chunks", 0) or 0)
+
+        if state == "running":
+            progress = 0.0
+            if total > 0:
+                progress = min(processed / max(total, 1), 1.0)
+            bar.progress(progress)
+            text.text(f"Processingâ€¦ {processed}/{total if total else 'â€”'}")
+        elif state == "done":
+            bar.progress(1.0)
+            text.text("âœ… Done")
+            return status
+        elif state == "failed":
+            bar.progress(0.0)
+            text.text("âŒ Failed")
+            return status
+
+        time.sleep(1)
+
+    text.text("â³ Timeout")
+    return {"status": "timeout", "error": "Processing timeout"}
 
 
-# Session state defaults
-if "active_job" not in st.session_state:
-    st.session_state["active_job"] = None
+def get_confidence_emoji(confidence: float) -> str:
+    if confidence >= 0.8:
+        return "ðŸ”¥"
+    if confidence >= 0.6:
+        return "âœ…"
+    if confidence >= 0.4:
+        return "âš ï¸"
+    return "ðŸ’¡"
 
-if "last_job_result" not in st.session_state:
-    st.session_state["last_job_result"] = None
 
-if "last_refresh_ts" not in st.session_state:
-    st.session_state["last_refresh_ts"] = 0.0
-
-
-# --- Sidebar: File Ingestion & Monitoring ---
+# Sidebar
 with st.sidebar:
-    st.header("1. Ingest Logs")
+    st.title("Acadia's Log IQ")
+    st.caption("AI-powered log analysis")
 
-    with st.expander("Backend connection"):
-        st.write("API_BASE:", API_BASE)
+    st.markdown("---")
+    st.header("📂 Data Ingestion")
 
-    uploaded_file = st.file_uploader(
-        "Upload .log or .txt file",
-        type=["log", "txt", "md"],
-        key="uploader"
+    # ✅ Multiple logs
+    log_files = st.file_uploader(
+        "Upload System Logs (multiple allowed)",
+        type=["log", "txt"],
+        key="log_uploader",
+        accept_multiple_files=True,
     )
 
-    col_a, col_b = st.columns(2)
+    # ✅ Multiple KBs (you had accept_multiple_files=True, keeping it)
+    kb_files = st.file_uploader(
+        "Upload Knowledge Base (multiple allowed)",
+        type=["txt", "md", "json"],
+        key="kb_uploader",
+        accept_multiple_files=True,
+    )
 
-    with col_a:
-        start_clicked = st.button("Start Fast Indexing", use_container_width=True)
+    if st.button("🚀 Start Indexing", use_container_width=True, type="primary"):
+        # Validation
+        if not log_files:
+            st.error("Please upload at least one log file.")
+            st.stop()
 
-    with col_b:
-        refresh_clicked = st.button("Refresh Status", use_container_width=True)
+        if not kb_files:
+            st.error("Please upload at least one knowledge base file.")
+            st.stop()
 
-    # CHANGE: Show current indexed files
-    st.divider()
-    st.subheader("📚 Indexed Files")
-    sources_data = fetch_sources_detailed()
-    sources = sources_data.get("sources", [])
-    details = sources_data.get("details", {})
-    total_chunks = sources_data.get("total_chunks", 0)
+        st.info("📤 Uploading files…")
 
-    if sources:
-        st.caption(f"Total: {len(sources)} files ({total_chunks} chunks)")
-        for src in sources:
-            chunk_count = details.get(src, 0)
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.caption(f"📄 {src} ({chunk_count} chunks)")
-            with col2:
-                if st.button("❌", key=f"del_{src}", help=f"Delete {src}"):
-                    with st.spinner(f"Deleting {src}..."):
-                        result = delete_source(src)
-                        if result:
-                            st.success(f"Deleted {src}")
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error(f"Failed to delete {src}")
-        
-        # Clear all button
-        if st.button("🗑️ Clear All Files", use_container_width=True, type="secondary"):
-            with st.spinner("Clearing all files..."):
-                result = clear_all_sources()
-                if result:
-                    st.success("All files cleared")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.error("Failed to clear files")
-    else:
-        st.info("No files indexed yet")
+        try:
+            # -------------------------------
+            # 1) Upload ALL logs
+            # -------------------------------
+            log_job_ids = []
+            for lf in log_files:
+                resp = make_request(
+                    "POST",
+                    "/upload?file_type=log",
+                    files={"file": (lf.name, lf.getvalue())},
+                )
+                if not resp:
+                    st.stop()
+                log_job_ids.append(resp["job_id"])
 
-    # Show last completed job summary
-    if st.session_state.get("last_job_result"):
-        st.divider()
-        st.subheader("Last Job Result")
-        jr = st.session_state["last_job_result"]
-        st.markdown(f"**File:** `{jr.get('file','')}`")
-        st.markdown(f"**Status:** `{jr.get('status','')}`")
-        st.caption(f"Processed chunks: {jr.get('processed_chunks', 0)}")
-        if st.button("Clear Last Result", use_container_width=True):
-            st.session_state["last_job_result"] = None
-            st.rerun()
+            # -------------------------------
+            # 2) Upload ALL KB files
+            # -------------------------------
+            kb_job_ids = []
+            for kf in kb_files:
+                resp = make_request(
+                    "POST",
+                    "/upload?file_type=kb",
+                    files={"file": (kf.name, kf.getvalue())},
+                )
+                if not resp:
+                    st.stop()
+                kb_job_ids.append(resp["job_id"])
 
-    # Handle file upload
-    if uploaded_file and start_clicked:
-        with st.spinner("Uploading to server..."):
-            result = safe_post_file(
-                f"{API_BASE}/upload",
-                uploaded_file.name,
-                uploaded_file.getvalue(),
-                timeout=120
+            st.success("Uploads accepted. Processing…")
+
+            # -------------------------------
+            # 3) Progress UI - Logs
+            # -------------------------------
+            st.write("Log indexing:")
+            log_statuses = []
+            for i, job_id in enumerate(log_job_ids, start=1):
+                st.write(f"• Log file {i}/{len(log_job_ids)} — job: {job_id[:8]}")
+                bar = st.progress(0)
+                txt = st.empty()
+                status = poll_job(job_id, bar, txt)
+                log_statuses.append(status)
+
+            # -------------------------------
+            # 4) Progress UI - KB
+            # -------------------------------
+            st.write("KB indexing:")
+            kb_statuses = []
+            for i, job_id in enumerate(kb_job_ids, start=1):
+                st.write(f"• KB file {i}/{len(kb_job_ids)} — job: {job_id[:8]}")
+                bar = st.progress(0)
+                txt = st.empty()
+                status = poll_job(job_id, bar, txt)
+                kb_statuses.append(status)
+
+            # -------------------------------
+            # 5) Check failures
+            # -------------------------------
+            any_log_failed = any(s and s.get("status") == "failed" for s in log_statuses)
+            any_kb_failed = any(s and s.get("status") == "failed" for s in kb_statuses)
+
+            if any_log_failed:
+                st.error("❌ One or more log files failed to index. Check API logs.")
+            if any_kb_failed:
+                st.error("❌ One or more KB files failed to index. Check API logs.")
+
+            all_done = (
+                log_statuses
+                and kb_statuses
+                and all(s and s.get("status") == "done" for s in log_statuses)
+                and all(s and s.get("status") == "done" for s in kb_statuses)
             )
 
-            if isinstance(result, Exception):
-                st.error(f"Connection error: {result}")
-            else:
-                if result.status_code == 200:
-                    try:
-                        job_id = result.json().get("job_id")
-                        if job_id:
-                            st.session_state["active_job"] = job_id
-                            st.session_state["last_job_result"] = None
-                            st.success(f"Job started: {job_id[:8]}")
-                        else:
-                            st.error("Upload succeeded but no job_id returned.")
-                    except Exception:
-                        st.error("Upload succeeded but response JSON was invalid.")
-                else:
-                    st.error(f"Upload failed: {result.status_code} — {result.text[:200]}")
+            if all_done:
+                st.success("✅ Indexing completed! System is ready for queries.")
 
-    # Progress Tracking Section
-    if st.session_state.get("active_job"):
-        st.divider()
-        st.subheader("Live Job Status")
+                now = datetime.now(timezone.utc).isoformat()
 
-        job_id = st.session_state["active_job"]
-        res = fetch_job_status(job_id)
+                # Store list of filenames in session state
+                st.session_state.uploaded_files["log"] = {
+                    "names": [f.name for f in log_files],
+                    "type": "log",
+                    "count": len(log_files),
+                    "total_size_mb": sum(len(f.getvalue()) for f in log_files) / (1024 * 1024),
+                    "uploaded_at": now,
+                }
 
-        status = res.get("status", "unknown")
-        processed = int(res.get("processed_chunks", 0) or 0)
-        total = int(res.get("total_chunks", 0) or 0)
-        message = res.get("message", "")
-        file = res.get("file", "")
+                st.session_state.uploaded_files["kb"] = {
+                    "names": [f.name for f in kb_files],
+                    "type": "kb",
+                    "count": len(kb_files),
+                    "total_size_mb": sum(len(f.getvalue()) for f in kb_files) / (1024 * 1024),
+                    "uploaded_at": now,
+                }
 
-        st.markdown(f"**Job:** `{job_id}`")
-        st.markdown(f"**Status:** `{status}`")
-        if file:
-            st.markdown(f"**File:** `{file}`")
-
-        if message:
-            st.caption(message)
-
-        if total > 0:
-            st.progress(min(processed / total, 1.0))
-            st.caption(f"{processed}/{total} chunks processed")
-        else:
-            st.caption(f"Processed chunks: {processed}")
-
-        if status in ["done", "failed"]:
-            st.session_state["last_job_result"] = {
-                "status": status,
-                "processed_chunks": processed,
-                "total_chunks": total,
-                "message": message,
-                "file": file,
-                "job_id": job_id,
-            }
-
-            if status == "done":
-                st.success("✅ Indexing completed successfully.")
-                st.balloons()
-            else:
-                st.error("❌ Indexing failed. Check API logs for details.")
-
-            st.session_state["active_job"] = None
-
-            if st.button("Dismiss / Continue", use_container_width=True):
                 st.rerun()
 
-        if refresh_clicked:
-            now = time.time()
-            if now - st.session_state["last_refresh_ts"] > 0.5:
-                st.session_state["last_refresh_ts"] = now
-                st.rerun()
+        except Exception as e:
+            st.error(f"❌ Error during indexing: {e}")
+
+    st.markdown("---")
+    st.header("📊 System Status")
+
+    if st.button("🔁 Check API Health", use_container_width=True):
+        with st.spinner("Checking API…"):
+            health = make_request("GET", "/health")
+            if health:
+                st.session_state.api_health = health
+                st.success("✅ API is healthy")
+                st.json(health)
+            else:
+                st.error("❌ API is not responding")
 
 
-# --- Main Interface: Chat & Retrieval ---
-st.header("2. Search & Analyze")
 
-# CRITICAL CHANGE: Don't filter by source - search ALL files
-sources_data = fetch_sources_detailed()
-sources = sources_data.get("sources", [])
-total_chunks = sources_data.get("total_chunks", 0)
+# Main page
+st.title("ðŸ” Ask questions about your logs")
 
-if not sources:
-    st.info("📤 Upload log files using the sidebar. Then ask questions here.")
+if st.session_state.uploaded_files.get("log") and st.session_state.uploaded_files.get("kb"):
+    st.caption(
+        f"Loaded: **{st.session_state.uploaded_files['log']['name']}** (logs) + "
+        f"**{st.session_state.uploaded_files['kb']['name']}** (KB)"
+    )
 else:
-    # Show what files are being searched
-    st.caption(f"🔎 Searching across **{len(sources)} file(s)** ({total_chunks} chunks total)")
-    with st.expander("📂 Files being searched"):
-        for src in sources:
-            chunk_count = sources_data.get("details", {}).get(src, 0)
-            st.caption(f"• {src} ({chunk_count} chunks)")
+    st.info("Upload and index both a log file and a KB file from the sidebar to start asking questions.")
 
-col1, col2 = st.columns([3, 1])
+# Chat history
+for msg in st.session_state.messages:
+    with st.chat_message(msg.get("role", "assistant")):
+        st.markdown(msg.get("content", ""))
+        sources = msg.get("sources")
+        if sources:
+            with st.expander("Sources"):
+                st.json(sources)
 
-with col1:
-    query = st.chat_input("Ask about error codes, timestamps, or system patterns...")
+# Chat input
+user_q = st.chat_input("Type your questionâ€¦")
+if user_q:
+    st.session_state.messages.append(
+        {"role": "user", "content": user_q, "timestamp": datetime.now(timezone.utc).isoformat()}
+    )
 
-# CHANGE: Search examples
-with col2:
-    with st.expander("💡 Examples"):
-        st.caption("Single file:")
-        st.code("What errors in router1.log?")
-        st.caption("Multi-file correlation:")
-        st.code("What caused the network outage?")
-        st.code("Show BGP issues across all devices")
-
-if query:
     with st.chat_message("user"):
-        st.markdown(query)
+        st.markdown(user_q)
 
     with st.chat_message("assistant"):
-        with st.spinner("Analyzing log vectors..."):
-            # CRITICAL CHANGE: Don't send "source" parameter
-            # This allows API to search ALL files and correlate
-            payload = {"q": query}
-            
-            result = safe_post_json(f"{API_BASE}/ask", payload, timeout=120)
+        with st.spinner("Thinkingâ€¦"):
+            resp = make_request("POST", "/ask", json={"q": user_q})
+            if resp:
+                confidence = float(resp.get("confidence", 0.0) or 0.0)
+                emoji = get_confidence_emoji(confidence)
 
-            if isinstance(result, Exception):
-                st.error(f"Failed to reach backend: {result}")
-            else:
-                if result.status_code == 200:
-                    try:
-                        data = result.json()
-                    except Exception:
-                        st.error("Backend returned invalid JSON.")
-                        data = {}
+                answer = resp.get("answer", "")
+                st.markdown(f"{emoji} {answer}")
 
-                    answer = data.get("answer", "No answer provided.")
-                    st.markdown(answer)
+                sources = {"logs": resp.get("log_sources", []), "kb": resp.get("kb_sources", [])}
+                with st.expander("Sources"):
+                    st.json(sources)
 
-                    # CHANGE: Show which files were used in the answer
-                    sources_used = data.get("sources", [])
-                    sources_count = data.get("sources_count", 0)
-                    
-                    if sources_used:
-                        st.divider()
-                        st.caption(f"📚 Sources used: {sources_count} file(s)")
-                        cols = st.columns(min(len(sources_used), 4))
-                        for idx, src in enumerate(sources_used):
-                            with cols[idx % 4]:
-                                st.caption(f"📄 {src}")
-
-                    # Show evidence
-                    if data.get("sources"):
-                        with st.expander("View Evidence (Log Fragments)"):
-                            st.json(data["sources"])
-                else:
-                    st.error(f"AI service error: {result.status_code} — {result.text[:200]}")
-
-# Footer
-st.divider()
-st.caption("Powered by AWS Bedrock (Titan Embeddings) & ChromaDB | Multi-device correlation enabled")
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"{emoji} {answer}",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "sources": sources,
+                    }
+                )

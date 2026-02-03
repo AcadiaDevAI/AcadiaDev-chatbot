@@ -1,496 +1,541 @@
-import os
-import re
-import time
-import uuid
 import json
-import traceback
+import logging
+import hashlib
+import sys
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Iterator
+from typing import Dict, List, Optional, TypedDict
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
-from pydantic import BaseModel
 import boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError
-
-from config import (
-    AWS_REGION,
-    BEDROCK_EMBED_MODEL,
-    BEDROCK_LLM_MODEL,
-    CHROMA_PERSIST_DIR,
-    COLLECTION_NAME,
+from botocore.config import Config as BotoConfig
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
 )
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from config import settings
 from vector_store import get_collection
 
-app = FastAPI()
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-# ------------------------------------------------------------------------------
-# Bedrock client configuration
-# ------------------------------------------------------------------------------
-AWS_PROFILE = os.getenv("AWS_PROFILE")
+# Minimal supported version
+if sys.version_info < (3, 11):
+    raise RuntimeError("This application requires Python 3.11 or higher")
 
-boto_cfg = Config(
-    retries={"max_attempts": 10, "mode": "standard"},
-    read_timeout=120,
-    connect_timeout=30,
+
+# Logging
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-
-if AWS_PROFILE:
-    session = boto3.Session(profile_name=AWS_PROFILE, region_name=AWS_REGION)
-else:
-    session = boto3.Session(region_name=AWS_REGION)
-
-_bedrock = session.client("bedrock-runtime", config=boto_cfg)
-
-# ------------------------------------------------------------------------------
-# Tunables
-# ------------------------------------------------------------------------------
-# CHANGE #1: Reduced embed delay for faster indexing (was 0.10, now 0.05)
-EMBED_DELAY_SECONDS = float(os.getenv("EMBED_DELAY_SECONDS", "0.05"))
-MAX_THROTTLE_RETRIES = int(os.getenv("MAX_THROTTLE_RETRIES", "12"))
-BACKOFF_BASE_SECONDS = float(os.getenv("BACKOFF_BASE_SECONDS", "0.5"))
-BACKOFF_MAX_SECONDS = float(os.getenv("BACKOFF_MAX_SECONDS", "20"))
-
-# Context / prompt controls
-# CHANGE #2: Increased results to search across more files (was 6, now 10)
-CHROMA_N_RESULTS = int(os.getenv("CHROMA_N_RESULTS", "10"))
-MAX_TOTAL_CONTEXT_CHARS = int(os.getenv("MAX_TOTAL_CONTEXT_CHARS", "20000"))
-# CHANGE #3: Allow more chunks for multi-file correlation (was 6, now 10)
-MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", "10"))
-MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "1800"))
-
-RETRY_MAX_TOTAL_CONTEXT_CHARS = int(os.getenv("RETRY_MAX_TOTAL_CONTEXT_CHARS", "9000"))
-RETRY_MAX_CONTEXT_CHUNKS = int(os.getenv("RETRY_MAX_CONTEXT_CHUNKS", "3"))
-RETRY_MAX_CHUNK_CHARS = int(os.getenv("RETRY_MAX_CHUNK_CHARS", "1200"))
+logger = logging.getLogger("acadia-log-iq")
 
 
-def _is_throttle_error(err: Exception) -> bool:
-    if not isinstance(err, ClientError):
-        return False
-    code = err.response.get("Error", {}).get("Code", "")
-    return code in (
-        "ThrottlingException",
-        "TooManyRequestsException",
-        "ProvisionedThroughputExceededException",
+class JobInfo(TypedDict, total=False):
+    job_id: str
+    status: str
+    processed_chunks: int
+    total_chunks: int
+    successful_chunks: int
+    file: Optional[str]
+    file_type: Optional[str]
+    file_size_mb: float
+    file_hash: str
+    error: Optional[str]
+    created_at: datetime
+    completed_at: Optional[datetime]
+
+
+UPLOAD_JOBS: Dict[str, JobInfo] = {}
+coll = None  # set at startup
+
+
+def _make_bedrock_client():
+    """
+    Create a Bedrock Runtime client.
+
+    Credential resolution order (boto3 default chain):
+    1) Env vars (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+    2) AWS_PROFILE / shared credentials (~/.aws/credentials or SSO config)
+    3) EC2 Instance Role (IMDS)  <-- best for server
+    """
+    boto_cfg = BotoConfig(
+        retries={"max_attempts": 10, "mode": "adaptive"},
+        read_timeout=120,
+        connect_timeout=30,
+        tcp_keepalive=True,
     )
 
+    kwargs = {
+        "service_name": "bedrock-runtime",
+        "region_name": settings.AWS_REGION,
+        "config": boto_cfg,
+    }
 
-def _invoke_bedrock(model_id: str, payload: dict) -> Any:
-    body = json.dumps(payload)
-    attempt = 0
-    while True:
-        try:
-            resp = _bedrock.invoke_model(
-                modelId=model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=body,
-            )
-            raw = resp["body"].read().decode("utf-8")
-            try:
-                return json.loads(raw)
-            except Exception:
-                return raw
+    # Only pass explicit credentials if provided (local dev)
+    if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
+        kwargs["aws_access_key_id"] = settings.AWS_ACCESS_KEY_ID
+        kwargs["aws_secret_access_key"] = settings.AWS_SECRET_ACCESS_KEY
+        if settings.AWS_SESSION_TOKEN:
+            kwargs["aws_session_token"] = settings.AWS_SESSION_TOKEN
 
-        except ClientError as e:
-            if _is_throttle_error(e) and attempt < MAX_THROTTLE_RETRIES:
-                wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
-                attempt += 1
-                time.sleep(wait)
-                continue
-            raise
+    return boto3.client(**kwargs)
 
 
-def bedrock_embed(text: str) -> List[float]:
-    out = _invoke_bedrock(BEDROCK_EMBED_MODEL, {"inputText": text})
-    if isinstance(out, dict):
-        if "embedding" in out:
-            return out["embedding"]
-        if "embeddings" in out and out["embeddings"]:
-            return out["embeddings"][0]
-        if "outputs" in out and out["outputs"]:
-            o = out["outputs"][0]
-            if "embedding" in o:
-                return o["embedding"]
-            if "embeddings" in o and o["embeddings"]:
-                return o["embeddings"][0]
-    raise ValueError("Unrecognized embedding response")
+bedrock = _make_bedrock_client()
 
 
-def bedrock_generate(prompt: str, max_tokens: int = 512) -> str:
-    out = _invoke_bedrock(BEDROCK_LLM_MODEL, {"prompt": prompt, "max_tokens": max_tokens})
-    if isinstance(out, dict):
-        if isinstance(out.get("output"), str):
-            return out["output"]
-        if isinstance(out.get("generated_text"), str):
-            return out["generated_text"]
-        if isinstance(out.get("outputs"), list) and out["outputs"]:
-            o = out["outputs"][0]
-            for k in ("text", "content", "generated_text", "output"):
-                v = o.get(k)
-                if isinstance(v, str) and v.strip():
-                    return v
-    if isinstance(out, str):
-        return out
-    raise ValueError("Unrecognized generation response")
+# Lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global coll
+    logger.info("Starting API…")
+    coll = get_collection()
+    logger.info("Chroma collection ready: %s", settings.COLLECTION_NAME)
+    yield
+    logger.info("Shutting down API…")
 
 
-# ------------------------------------------------------------------------------
-# Chroma & Helpers
-# ------------------------------------------------------------------------------
-coll = get_collection()
-UPLOAD_JOBS: Dict[str, Dict[str, Any]] = {}
-
-
-class Q(BaseModel):
-    q: str
-    device: Optional[str] = None
-    source: Optional[str] = None
-
-
-# CHANGE #4: Updated system prompt to support multi-file correlation
-SYS_PROMPT = (
-    "You are a Cisco TAC engineer analyzing logs from multiple devices. "
-    "Answer the question using the provided log fragments from various sources. "
-    "When logs from different devices show related events, identify the correlation. "
-    "Cite which device/source each piece of evidence comes from. "
-    "If the logs do not contain enough evidence, say what is missing."
+app = FastAPI(
+    title="Acadia's Log IQ API",
+    description="AI-powered log analysis and troubleshooting system",
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 
-def _extract_filename(question: str) -> str | None:
-    m = re.search(r"\b(\S+\.(?:log|txt|csv|json|md))\b", question, flags=re.I)
-    return m.group(1) if m else None
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8501",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Processing-Time"],
+    max_age=600,
+)
 
 
-# CHANGE #5: Enhanced context builder to show file sources clearly
-def build_smart_context(
-    documents: list[str],
-    metadatas: list[dict],
-    max_chars: int = MAX_TOTAL_CONTEXT_CHARS,
-    max_doc_chars: int = MAX_CHUNK_CHARS,
-    max_docs: int = MAX_CONTEXT_CHUNKS,
-) -> str:
+def verify_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> bool:
     """
-    Combines top documents until character limit is reached.
-    Now includes source information for multi-file correlation.
+    If API_KEY is set in .env, every request must send:
+      X-API-Key: <API_KEY>
     """
-    context_parts: List[str] = []
-    current_length = 0
-
-    for idx, doc in enumerate((documents or [])[:max_docs]):
-        doc = (doc or "").strip()
-        if not doc:
-            continue
-
-        # Get source info from metadata
-        meta = metadatas[idx] if idx < len(metadatas) else {}
-        source = meta.get("source", "unknown")
-        device = meta.get("device", source)
-
-        if len(doc) > max_doc_chars:
-            doc = doc[:max_doc_chars] + "…"
-
-        # Add source header for context
-        doc_with_source = f"[Source: {source}]\n{doc}"
-        add_len = len(doc_with_source) + 50
-
-        if current_length + add_len > max_chars:
-            break
-
-        context_parts.append(doc_with_source)
-        current_length += add_len
-
-    return "\n\n---\n\n".join(context_parts)
+    if settings.API_KEY:
+        if not x_api_key or x_api_key != settings.API_KEY:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing API key",
+                headers={"WWW-Authenticate": "APIKey"},
+            )
+    return True
 
 
-# ------------------------------------------------------------------------------
-# Core indexing helpers + endpoints
-# ------------------------------------------------------------------------------
-def iter_chunks_from_file(file_path: str, max_chars: int = 4000, overlap: int = 300) -> Iterator[str]:
-    buf = ""
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            buf += line
-            while len(buf) >= max_chars:
-                chunk = buf[:max_chars].strip()
-                if chunk:
-                    yield chunk
-                buf = buf[max_chars - overlap :]
-    tail = buf.strip()
-    if tail:
-        yield tail
+class Question(BaseModel):
+    q: str = Field(min_length=1, max_length=1000)
+
+    model_config = ConfigDict(extra="ignore")
+
+    @field_validator("q")
+    @classmethod
+    def validate_q(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("Question cannot be empty")
+        return v
 
 
-def clear_collection() -> None:
-    """
-    Deletes ALL data from the collection.
-    Use the /clear endpoint to start fresh with no files.
-    """
+class UploadResponse(BaseModel):
+    job_id: str
+    message: str
+    file_hash: Optional[str] = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class JobStatus(BaseModel):
+    job_id: str
+    status: str
+    processed_chunks: int = 0
+    total_chunks: Optional[int] = None
+    successful_chunks: Optional[int] = None
+    file: Optional[str] = None
+    file_type: Optional[str] = None
+    file_size_mb: Optional[float] = None
+    file_hash: Optional[str] = None
+    error: Optional[str] = None
+    created_at: datetime
+    completed_at: Optional[datetime] = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class AnswerResponse(BaseModel):
+    answer: str
+    log_sources: List[str]
+    kb_sources: List[str]
+    confidence: float = Field(ge=0, le=1)
+    processing_time_ms: Optional[int] = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
+def safe_embed(text: str) -> Optional[List[float]]:
+    if not text or not text.strip():
+        return None
     try:
-        all_data = coll.get(include=[])
-        all_ids = all_data.get("ids", [])
-        
-        if all_ids:
-            batch_size = 5000
-            for i in range(0, len(all_ids), batch_size):
-                batch = all_ids[i:i + batch_size]
-                coll.delete(ids=batch)
-            print(f"Cleared {len(all_ids)} vectors from collection")
-    except Exception as e:
-        print(f"Error clearing collection: {e}")
-        raise
+        truncated = text[: settings.MAX_CHARS]
+        body = json.dumps({"inputText": truncated}).encode("utf-8")
 
-
-# CHANGE #6: New function to delete specific file
-def delete_file_from_collection(filename: str) -> int:
-    """
-    Deletes all chunks from a specific file.
-    Returns the number of chunks deleted.
-    """
-    try:
-        results = coll.get(
-            where={"source": filename},
-            include=[]
+        resp = bedrock.invoke_model(
+            modelId=settings.BEDROCK_EMBED_MODEL,
+            body=body,
+            accept="application/json",
+            contentType="application/json",
         )
-        ids_to_delete = results.get("ids", [])
-        
-        if ids_to_delete:
-            batch_size = 5000
-            for i in range(0, len(ids_to_delete), batch_size):
-                batch = ids_to_delete[i:i + batch_size]
-                coll.delete(ids=batch)
-            print(f"Deleted {len(ids_to_delete)} vectors from {filename}")
-            return len(ids_to_delete)
-        return 0
+        payload = json.loads(resp["body"].read().decode("utf-8"))
+        emb = payload.get("embedding")
+        if not isinstance(emb, list):
+            return None
+        return emb
     except Exception as e:
-        print(f"Error deleting {filename}: {e}")
-        raise
+        logger.exception("Embedding failed: %s", e)
+        return None
 
 
-# CHANGE #7: REMOVED clear_collection() call - now keeps all files!
-def index_file_job(job_id: str, file_path: str, filename: str) -> None:
+def safe_generate(prompt: str, max_tokens: int = 1024) -> str:
     try:
-        UPLOAD_JOBS[job_id]["status"] = "running"
-        
-        # Check if this file already exists and delete old version
-        existing = coll.get(where={"source": filename}, limit=1).get("ids")
-        if existing:
-            print(f"File {filename} already exists, replacing...")
-            delete_file_from_collection(filename)
-        
+        body = json.dumps(
+            {
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.1,
+                "top_p": 0.9,
+            }
+        ).encode("utf-8")
+
+        resp = bedrock.invoke_model(
+            modelId=settings.BEDROCK_LLM_MODEL,
+            body=body,
+            accept="application/json",
+            contentType="application/json",
+        )
+        payload = json.loads(resp["body"].read().decode("utf-8"))
+
+        # Try common shapes
+        if isinstance(payload, dict):
+            if "outputs" in payload and payload["outputs"]:
+                return (payload["outputs"][0].get("text") or "").strip() or "No response generated."
+            if "generation" in payload:
+                return str(payload["generation"]).strip()
+            if "outputText" in payload:
+                return str(payload["outputText"]).strip()
+
+        return "No response generated."
+    except Exception as e:
+        logger.exception("Generation failed: %s", e)
+        return "I hit an error while generating a response. Please try again."
+
+
+def calculate_file_hash(file_path: Path) -> str:
+    sha = hashlib.sha256()
+    with file_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+def iter_line_chunks(file_path: Path, lines_per_chunk: int = 100):
+    try:
+        with file_path.open("r", encoding="utf-8", errors="ignore") as f:
+            buf: List[str] = []
+            buf_size = 0
+            for line in f:
+                buf.append(line)
+                buf_size += len(line)
+                if len(buf) >= lines_per_chunk or buf_size > 100_000:
+                    yield "".join(buf)
+                    buf.clear()
+                    buf_size = 0
+            if buf:
+                yield "".join(buf)
+    except Exception as e:
+        logger.exception("Failed reading file %s: %s", file_path, e)
+        yield ""
+
+
+async def index_file_job(job_id: str, file_path: Path, filename: str, file_type: str):
+    try:
+        job = UPLOAD_JOBS.get(job_id)
+        if not job:
+            return
+
+        job["status"] = "running"
+        total_chunks = 0
+        ok_chunks = 0
+
+        batch_embeddings: List[List[float]] = []
+        batch_documents: List[str] = []
+        batch_metadatas: List[Dict] = []
         batch_ids: List[str] = []
-        batch_metas: List[Dict[str, Any]] = []
-        batch_docs: List[str] = []
-        batch_embs: List[List[float]] = []
-        total = 0
 
-        for ch in iter_chunks_from_file(file_path):
-            total += 1
-            UPLOAD_JOBS[job_id]["processed_chunks"] = total
+        for chunk in iter_line_chunks(file_path):
+            total_chunks += 1
+            emb = safe_embed(chunk)
+            if not emb:
+                continue
 
-            emb = bedrock_embed(ch)
-            if EMBED_DELAY_SECONDS > 0:
-                time.sleep(EMBED_DELAY_SECONDS)
+            chunk_id = f"{job_id}-{ok_chunks}"
+            ok_chunks += 1
 
-            batch_ids.append(f"{filename}-{job_id}-{total}")
-            batch_metas.append({"source": filename, "device": filename})
-            batch_docs.append(ch)
-            batch_embs.append(emb)
+            batch_ids.append(chunk_id)
+            batch_embeddings.append(emb)
+            batch_documents.append(chunk)
+            batch_metadatas.append(
+                {
+                    "source": filename,
+                    "file_type": file_type,
+                    "job_id": job_id,
+                    "chunk_index": ok_chunks - 1,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
 
-            if len(batch_ids) >= 200:
-                coll.add(ids=batch_ids, metadatas=batch_metas, documents=batch_docs, embeddings=batch_embs)
-                batch_ids, batch_metas, batch_docs, batch_embs = [], [], [], []
+            if ok_chunks % 10 == 0:
+                job["processed_chunks"] = ok_chunks
 
-        if batch_ids:
-            coll.add(ids=batch_ids, metadatas=batch_metas, documents=batch_docs, embeddings=batch_embs)
+            if len(batch_embeddings) >= settings.BATCH_SIZE:
+                coll.add(
+                    ids=batch_ids,
+                    embeddings=batch_embeddings,
+                    metadatas=batch_metadatas,
+                    documents=batch_documents,
+                )
+                batch_ids, batch_embeddings, batch_metadatas, batch_documents = [], [], [], []
 
-        UPLOAD_JOBS[job_id]["status"] = "done"
-        print(f"Successfully indexed {filename} with {total} chunks")
+        if batch_embeddings:
+            coll.add(
+                ids=batch_ids,
+                embeddings=batch_embeddings,
+                metadatas=batch_metadatas,
+                documents=batch_documents,
+            )
+
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        job["status"] = "done"
+        job["processed_chunks"] = ok_chunks
+        job["total_chunks"] = total_chunks
+        job["successful_chunks"] = ok_chunks
+        job["completed_at"] = datetime.now(timezone.utc)
 
     except Exception as e:
-        traceback.print_exc()
-        UPLOAD_JOBS[job_id]["status"] = "failed"
-        UPLOAD_JOBS[job_id]["message"] = str(e)
+        logger.exception("Index job failed %s: %s", job_id, e)
+        if job_id in UPLOAD_JOBS:
+            UPLOAD_JOBS[job_id]["status"] = "failed"
+            UPLOAD_JOBS[job_id]["error"] = str(e)
+            UPLOAD_JOBS[job_id]["completed_at"] = datetime.now(timezone.utc)
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
-@app.get("/sources")
-def sources():
-    """
-    CHANGE #8: Enhanced to show chunk counts per file
-    """
-    metas = coll.get(include=["metadatas"]).get("metadatas") or []
-    
-    # Count chunks per source
-    source_counts = {}
-    for m in metas:
-        if isinstance(m, dict) and m.get("source"):
-            source = m["source"]
-            source_counts[source] = source_counts.get(source, 0) + 1
-    
-    files = sorted(source_counts.keys())
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    import time
+
+    start = time.perf_counter()
+    response = await call_next(request)
+    ms = (time.perf_counter() - start) * 1000.0
+    response.headers["X-Processing-Time"] = f"{ms:.2f}ms"
+    logger.info("%s %s -> %s (%.2fms)", request.method, request.url.path, response.status_code, ms)
+    return response
+
+
+@app.get("/health")
+async def health_check():
     return {
-        "sources": files,
-        "count": len(files),
-        "details": source_counts,
-        "total_chunks": coll.count()
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "python_version": sys.version,
+        "services": {
+            "vector_store": "healthy" if coll is not None else "uninitialized",
+            "bedrock": "available",
+        },
     }
 
 
-@app.post("/clear")
-def clear_all_data():
-    """
-    CHANGE #9: Added warning about clearing all files
-    """
-    try:
-        count = coll.count()
-        clear_collection()
-        return {
-            "status": "success", 
-            "message": f"Cleared all data from collection ({count} chunks removed)"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/upload", response_model=UploadResponse)
+@limiter.limit("10/minute")
+async def upload(
+    request: Request,  # REQUIRED for slowapi
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    file_type: str = Query(default="log", pattern="^(log|kb)$"),
+    _: bool = Depends(verify_api_key),
+):
+    file_ext = Path(file.filename).suffix[1:].lower() if file.filename else ""
+    if not file_ext or file_ext not in settings.ALLOWED_FILE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File type '{file_ext}' not allowed. Allowed: {settings.ALLOWED_FILE_TYPES}",
+        )
+
+    job_id = uuid.uuid4().hex
+    safe_filename = f"{job_id}_{Path(file.filename).name}"
+    file_path = settings.UPLOAD_DIR / safe_filename
+
+    content = await file.read()
+    size_mb = len(content) / (1024 * 1024)
+
+    if size_mb > settings.MAX_FILE_SIZE_MB:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File size ({size_mb:.1f}MB) exceeds limit of {settings.MAX_FILE_SIZE_MB}MB",
+        )
+
+    file_path.write_bytes(content)
+    file_hash = calculate_file_hash(file_path)
+
+    created_at = datetime.now(timezone.utc)
+    UPLOAD_JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "processed_chunks": 0,
+        "total_chunks": 0,
+        "successful_chunks": 0,
+        "file": file.filename,
+        "file_type": file_type,
+        "file_size_mb": size_mb,
+        "file_hash": file_hash,
+        "created_at": created_at,
+    }
+
+    background_tasks.add_task(index_file_job, job_id, file_path, file.filename, file_type)
+
+    return UploadResponse(
+        job_id=job_id,
+        message="File uploaded successfully. Processing started.",
+        file_hash=file_hash,
+    )
 
 
-# CHANGE #10: New endpoint to delete specific file
-@app.delete("/sources/{filename}")
-def delete_source(filename: str):
-    """
-    Delete a specific file from the collection.
-    Allows removing individual files while keeping others.
-    """
-    try:
-        count = delete_file_from_collection(filename)
-        if count == 0:
-            raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
-        return {
-            "status": "success",
-            "file": filename,
-            "deleted_chunks": count
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/upload_status/{job_id}")
-def upload_status(job_id: str):
+@app.get("/upload_status/{job_id}", response_model=JobStatus)
+async def upload_status(job_id: str, _: bool = Depends(verify_api_key)):
     job = UPLOAD_JOBS.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="job_id not found")
-    return job
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JobStatus(**job)
 
 
-@app.post("/upload")
-async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="Empty file")
+@app.post("/ask", response_model=AnswerResponse)
+@limiter.limit("30/minute")
+async def ask(
+    request: Request,  # REQUIRED for slowapi
+    req: Question,
+    _: bool = Depends(verify_api_key),
+):
+    import time
 
-        uploads_dir = Path("uploads")
-        uploads_dir.mkdir(parents=True, exist_ok=True)
+    start = time.perf_counter()
 
-        job_id = uuid.uuid4().hex
-        safe_name = Path(file.filename).name
-        file_path = str(uploads_dir / f"{job_id}__{safe_name}")
+    if coll is None:
+        raise HTTPException(status_code=503, detail="Vector store is not ready")
 
-        Path(file_path).write_bytes(content)
+    q_emb = safe_embed(req.q)
+    if not q_emb:
+        raise HTTPException(status_code=500, detail="Failed to generate question embedding")
 
-        UPLOAD_JOBS[job_id] = {"status": "queued", "processed_chunks": 0, "file": safe_name}
-        background_tasks.add_task(index_file_job, job_id, file_path, safe_name)
+    log_results = coll.query(query_embeddings=[q_emb], n_results=5, where={"file_type": "log"})
+    kb_results = coll.query(query_embeddings=[q_emb], n_results=3, where={"file_type": "kb"})
 
-        return {"status": "accepted", "job_id": job_id, "file": safe_name}
+    log_docs = (log_results.get("documents") or [[]])[0]
+    kb_docs = (kb_results.get("documents") or [[]])[0]
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    log_context = "\n".join(log_docs) if log_docs else "No relevant log entries found."
+    kb_context = "\n".join(kb_docs) if kb_docs else "No relevant knowledge base articles found."
+
+    log_sources = sorted({m.get("source", "") for m in (log_results.get("metadatas") or [[]])[0] if m})
+    kb_sources = sorted({m.get("source", "") for m in (kb_results.get("metadatas") or [[]])[0] if m})
+
+    confidence = min(0.3 + (len(log_docs) * 0.1) + (len(kb_docs) * 0.15), 1.0)
+
+    prompt = f"""You are an expert system administrator analyzing logs and knowledge base articles.
+
+LOG ENTRIES:
+{log_context}
+
+KNOWLEDGE BASE ARTICLES:
+{kb_context}
+
+USER QUESTION: {req.q}
+
+Provide a concise, accurate answer based on the information above.
+- If the logs show errors, explain them clearly.
+- If KB articles provide solutions, summarize them.
+- If information is insufficient, say what additional details are needed.
+
+ANSWER:"""
+
+    answer = safe_generate(prompt)
+    ms = int((time.perf_counter() - start) * 1000)
+
+    return AnswerResponse(
+        answer=answer,
+        log_sources=[s for s in log_sources if s],
+        kb_sources=[s for s in kb_sources if s],
+        confidence=confidence,
+        processing_time_ms=ms,
+    )
 
 
-# CHANGE #11: Enhanced /ask endpoint for multi-file correlation
-@app.post("/ask")
-def ask(req: Q):
-    start = time.time()
-    try:
-        emb = bedrock_embed(req.q)
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "path": request.url.path,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
-        # CHANGE #12: Don't filter by source unless explicitly requested
-        where: Dict[str, Any] = {}
-        if req.device:
-            where["device"] = req.device
-        if req.source:
-            where["source"] = req.source
-        # Removed automatic filename extraction - search ALL files by default
 
-        docs = coll.query(
-            query_embeddings=[emb],
-            n_results=CHROMA_N_RESULTS,
-            where=where or None,
-            include=["documents", "metadatas"],
-        )
-
-        if not docs.get("documents") or not docs["documents"][0]:
-            return {
-                "answer": "No relevant logs found.",
-                "sources": [],
-                "timing": {"duration_ms": int((time.time() - start) * 1000)},
-            }
-
-        # CHANGE #13: Pass metadatas to context builder for source labels
-        context = build_smart_context(
-            docs["documents"][0],
-            docs["metadatas"][0],
-            max_chars=MAX_TOTAL_CONTEXT_CHARS,
-            max_doc_chars=MAX_CHUNK_CHARS,
-            max_docs=MAX_CONTEXT_CHUNKS,
-        )
-        
-        # CHANGE #14: Enhanced prompt to encourage correlation
-        prompt = (
-            f"{SYS_PROMPT}\n\n"
-            f"Logs from multiple devices:\n{context}\n\n"
-            f"Question: {req.q}\n"
-            f"Answer (cite sources):"
-        )
-
-        try:
-            ans = bedrock_generate(prompt)
-        except Exception as e:
-            msg = str(e)
-            if "maximum context length" in msg or "ValidationException" in msg:
-                context = build_smart_context(
-                    docs["documents"][0],
-                    docs["metadatas"][0],
-                    max_chars=RETRY_MAX_TOTAL_CONTEXT_CHARS,
-                    max_doc_chars=RETRY_MAX_CHUNK_CHARS,
-                    max_docs=RETRY_MAX_CONTEXT_CHUNKS,
-                )
-                prompt = (
-                    f"{SYS_PROMPT}\n\n"
-                    f"Logs:\n{context}\n\n"
-                    f"Q: {req.q}\nA:"
-                )
-                ans = bedrock_generate(prompt)
-            else:
-                raise
-
-        # CHANGE #15: Return unique sources for the answer
-        unique_sources = list(set(m.get("source", "unknown") for m in docs["metadatas"][0]))
-        
-        return {
-            "answer": ans,
-            "sources": unique_sources,
-            "sources_count": len(unique_sources),
-            "timing": {"duration_ms": int((time.time() - start) * 1000)},
-        }
-
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "path": request.url.path,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
