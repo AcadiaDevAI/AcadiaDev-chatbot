@@ -24,6 +24,9 @@ from vector_store import get_collection
 
 app = FastAPI()
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 # ------------------------------------------------------------------------------
 # Bedrock client configuration
 # ------------------------------------------------------------------------------
