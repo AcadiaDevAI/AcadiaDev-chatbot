@@ -1,18 +1,37 @@
+# ============================================================================
+# Acadia Log IQ v2.0 — Mistral 7B + Hybrid Search + Re-ranking
+# ============================================================================
+
+# Web Framework
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.9
 
+# AWS Bedrock (Mistral 7B + Titan Embed V2)
 boto3>=1.34.0
 botocore>=1.34.0
 
+# Vector Store
 chromadb>=0.5.5
 
+# Validation
 pydantic>=2.7.0,<3
 pydantic-settings>=2.3.0,<3
 
+# Rate Limiting
 slowapi>=0.1.9
 
+# HTTP (UI -> API)
 requests>=2.31.0
 
-# CRITICAL: Added Streamlit for the UI (chat.py)
+# UI
 streamlit>=1.31.0
+
+# PDF Extraction
+PyMuPDF>=1.24.0
+
+# DOCX Extraction
+python-docx>=1.1.0
+
+# NOTE: BM25 is implemented in pure Python (vector_store.py)
+# No additional library needed for keyword search.
